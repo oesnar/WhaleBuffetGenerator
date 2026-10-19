@@ -1,8 +1,10 @@
 import pytest
+from typing import cast
 
 from app import (
     apply_distribution_effect,
     apply_lil_monsta_effect,
+    apply_minionless_demon_rule,
     apply_pinned_assignments,
     apply_summoner_effect,
     build_available_dummy_name,
@@ -15,8 +17,11 @@ from app import (
     format_assignment_export,
     format_effect_display,
     format_lil_monsta_character,
+    NumericSetupEffect,
+    numeric_effect_choices,
     format_pin_display,
     is_lil_monsta_character,
+    numeric_effect_choices,
     parse_distribution_effect,
     parse_imported_player,
     parse_remembered_grimoire,
@@ -27,6 +32,7 @@ from whalebuffetgenerator.logic import (
     ROLE_ORDER,
     build_role_dictionary,
     extract_distribution_effect,
+    normalize_player,
     resolve_preferred_role,
 )
 
@@ -151,6 +157,41 @@ def test_build_role_dictionary_groups_roles_by_team():
     assert dictionary["demon"] == ["Imp"]
 
 
+def test_build_role_dictionary_excludes_unselectable_characters():
+    dictionary = build_role_dictionary(
+        [
+            {"name": "Drunk", "team": "outsider"},
+            {"name": "Lunatic", "team": "outsider"},
+            {"name": "Marionette", "team": "minion"},
+            {"name": "Recluse", "team": "outsider"},
+        ]
+    )
+
+    assert dictionary["outsider"] == ["Recluse"]
+    assert dictionary["minion"] == []
+
+
+def test_normalize_player_removes_unselectable_character_preferences():
+    normalized = normalize_player(
+        {
+            "name": "Alice",
+            "preferred_roles": {
+                "townsfolk": "Lunatic",
+                "outsider": "Drunk",
+                "minion": "Marionette",
+                "demon": "Imp",
+            },
+        }
+    )
+
+    assert normalized["preferred_roles"] == {
+        "townsfolk": "",
+        "outsider": "",
+        "minion": "",
+        "demon": "Imp",
+    }
+
+
 def test_resolve_preferred_role_returns_player_preference_for_role_type():
     player = {
         "name": "Alice",
@@ -200,9 +241,90 @@ def test_extract_distribution_effect_parses_bracketed_modifiers():
 
 
 def test_parse_distribution_effect_handles_simple_modifier_text():
-    assert parse_distribution_effect("+1 Outsider") == (1, "outsider")
-    assert parse_distribution_effect("+2 Outsiders") == (2, "outsider")
+    parsed = parse_distribution_effect("+1 Outsider")
+    assert isinstance(parsed, NumericSetupEffect)
+    assert parsed.role == "outsider"
+    assert [(choice.value, choice.label) for choice in parsed.choices] == [(1, "+1 Outsider")]
     assert parse_distribution_effect("Nothing special") is None
+
+
+@pytest.mark.parametrize(
+    ("effect_text", "expected_role", "expected_choices", "expected_mode"),
+    [
+        ("+0 or +1 Outsider", "outsider", [(0, "+0 Outsiders"), (1, "+1 Outsider")], "delta"),
+        ("-0 or -1 Outsider", "outsider", [(0, "-0 Outsiders"), (-1, "-1 Outsider")], "delta"),
+        ("-1 or +1 Outsider", "outsider", [(-1, "-1 Outsider"), (1, "+1 Outsider")], "delta"),
+        (
+            "+0 to +2 Village Idiots. 1 of the extras is drunk",
+            "village idiot",
+            [(0, "+0 Village Idiots"), (1, "+1 Village Idiot"), (2, "+2 Village Idiots")],
+            "copies",
+        ),
+        ("X Outsiders", "outsider", [], "total"),
+        (
+            "Evil characters are in a line. You are in the middle. +1 Minion. -? to +? Outsiders",
+            "outsider",
+            [],
+            "flex_range",
+        ),
+    ],
+)
+def test_parse_distribution_effect_supports_setup_numeric_formats(effect_text, expected_role, expected_choices, expected_mode):
+    parsed = parse_distribution_effect(effect_text)
+
+    assert parsed is not None
+    assert parsed.role == expected_role
+    assert [(choice.value, choice.label) for choice in parsed.choices] == expected_choices
+    assert parsed.mode == expected_mode
+
+
+def test_numeric_effect_choices_filter_by_available_players():
+    assignments = [("Town 1", "townsfolk"), ("Town 2", "townsfolk"), ("Out 1", "outsider")]
+
+    balloonist = numeric_effect_choices(parse_distribution_effect("+0 or +1 Outsider"), assignments)
+    hermit = numeric_effect_choices(parse_distribution_effect("-0 or -1 Outsider"), assignments)
+    godfather = numeric_effect_choices(parse_distribution_effect("-1 or +1 Outsider"), assignments)
+
+    assert [choice.value for choice in balloonist] == [0, 1]
+    assert [choice.value for choice in hermit] == [0, -1]
+    assert [choice.value for choice in godfather] == [-1, 1]
+
+
+def test_apply_distribution_effect_supports_positive_negative_and_zero_choices():
+    assignments = [
+        ("Town 1", "townsfolk"),
+        ("Town 2", "townsfolk"),
+        ("Out 1", "outsider"),
+        ("Minion", "minion"),
+        ("Demon", "demon"),
+    ]
+
+    added = apply_distribution_effect(assignments, "+1 Outsider", ["Town 1"], effect_choice=1)
+    removed = apply_distribution_effect(assignments, "-1 Outsider", ["Out 1"], effect_choice=-1)
+    added_minion = apply_distribution_effect(assignments, "+1 Minion", ["Town 1"], effect_choice=1)
+    zero = apply_distribution_effect(assignments, "+0 or +1 Outsider", [], effect_choice=0)
+
+    assert ("Town 1", "outsider") in added
+    assert ("Out 1", "townsfolk") in removed
+    assert ("Town 1", "minion") in added_minion
+    assert zero == assignments
+
+
+def test_xaan_effect_uses_absolute_outsider_total():
+    assignments = [
+        ("Town 1", "townsfolk"),
+        ("Town 2", "townsfolk"),
+        ("Town 3", "townsfolk"),
+        ("Out 1", "outsider"),
+        ("Minion", "minion"),
+        ("Demon", "demon"),
+    ]
+
+    updated = apply_distribution_effect(assignments, "X Outsiders", ["Town 1", "Town 2"], effect_choice=3)
+
+    assert sum(role == "outsider" for _, role in updated) == 3
+    assert ("Town 1", "outsider") in updated
+    assert ("Town 2", "outsider") in updated
 
 
 def test_format_effect_display_and_pin_display_are_separate():
@@ -252,6 +374,20 @@ def test_parse_imported_player_rejects_missing_or_extra_fields(data):
         parse_imported_player(data)
 
 
+@pytest.mark.parametrize("role_name", ["Drunk", "Lunatic", "Marionette"])
+def test_parse_imported_player_rejects_unselectable_preferences(role_name):
+    with pytest.raises(ValueError, match="cannot be selected"):
+        parse_imported_player(
+            {
+                "name": "Alice",
+                "townsfolk": "Librarian",
+                "outsider": role_name,
+                "minion": "Baron",
+                "demon": "Imp",
+            }
+        )
+
+
 def test_remembered_grimoire_round_trip_preserves_players_and_empty_roster():
     players = [
         {
@@ -273,6 +409,18 @@ def test_remembered_grimoire_rejects_duplicate_names():
 
     with pytest.raises(ValueError, match="duplicate"):
         parse_remembered_grimoire(saved)
+
+
+def test_remembered_grimoire_clears_newly_unselectable_preferences():
+    player = {
+        "name": "Alice",
+        "preferred_roles": {"townsfolk": "Librarian", "outsider": "Drunk", "minion": "Baron", "demon": "Imp"},
+    }
+
+    restored = parse_remembered_grimoire(build_remembered_grimoire([player]))
+
+    assert restored[0]["preferred_roles"]["outsider"] == ""
+    assert restored[0]["preferred_roles"]["townsfolk"] == "Librarian"
 
 
 def test_describe_effect_candidate_shows_current_and_new_character():
@@ -356,6 +504,47 @@ def test_lil_monsta_display_retains_original_and_minion_character():
     assert is_lil_monsta_character("Lil' Monsta")
     assert is_lil_monsta_character("Lil’ Monsta")
     assert format_lil_monsta_character("Lil' Monsta", "Baron") == "Lil' Monsta (Baron)"
+
+
+@pytest.mark.parametrize("demon_name", ["Kazali", "Lord of Typhon"])
+def test_minionless_demon_variants_convert_minion_slots_to_townsfolk(demon_name):
+    assignments = [("Alice", "townsfolk"), ("Bob", "minion"), ("Charlie", "demon")]
+
+    updated, converted = apply_minionless_demon_rule(assignments, {"Charlie": demon_name})
+
+    assert updated == [("Alice", "townsfolk"), ("Bob", "townsfolk"), ("Charlie", "demon")]
+    assert converted == {"Bob"}
+    assert apply_minionless_demon_rule(assignments, {"Charlie": "Imp"}) == (assignments, set())
+
+
+def test_gui_generation_removes_minions_for_kazali():
+    from app import WhaleBuffetApp
+
+    window = WhaleBuffetApp()
+    try:
+        window.players = [
+            {
+                "name": f"Player {index}",
+                "preferred_roles": {
+                        "townsfolk": "" if index == 0 else "Librarian",
+                    "outsider": "Recluse",
+                    "minion": "" if index == 0 else "Baron",
+                    "demon": "Kazali" if index == 0 else "",
+                },
+            }
+            for index in range(5)
+        ]
+        window.refresh_player_table()
+        window.generate_roles()
+
+        assignments = cast(list[tuple[str, str]], window.assignment_rows)
+        assert len(assignments) == 5
+        assert sum(role == "demon" for _, role in assignments) == 1
+        assert sum(role == "minion" for _, role in assignments) == 0
+        assert sum(role == "townsfolk" for _, role in assignments) == 4
+        assert "Kazali" in window.assignment_display_roles.values()
+    finally:
+        window.destroy()
 
 
 def test_preserve_pins_for_assignments_keeps_valid_pins_across_rerolls():

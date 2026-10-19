@@ -199,6 +199,7 @@
                 </fieldset>
                 <div class="actions" style="margin-top: 18px">
                     <button id="submit-button" type="submit">Send preferences</button>
+                    <button id="character-button" type="button" hidden>Check my character</button>
                 </div>
             </form>
         </section>
@@ -210,8 +211,10 @@
         const preferencesSection = document.querySelector("#preferences-section");
         const preferencesForm = document.querySelector("#preferences-form");
         const submitButton = document.querySelector("#submit-button");
+        const characterButton = document.querySelector("#character-button");
         const status = document.querySelector("#status");
         let connectedRoomCode = "";
+        let playerToken = "";
 
         function setStatus(message, kind = "") {
             status.textContent = message;
@@ -235,6 +238,8 @@
                 connectButton.textContent = "Connect";
                 submitButton.textContent = "Send preferences";
                 submitButton.disabled = false;
+                characterButton.hidden = true;
+                playerToken = "";
                 setStatus("Enter the room code shared by your Storyteller.");
                 return;
             }
@@ -287,12 +292,39 @@
                     body: JSON.stringify(player),
                 });
                 const data = await readResponse(response);
+                if (data.player_token) {
+                    playerToken = data.player_token;
+                    characterButton.hidden = false;
+                }
                 submitButton.textContent = "Send again";
                 setStatus(data.message, "success");
             } catch (error) {
                 setStatus(error.message, "error");
             } finally {
                 submitButton.disabled = false;
+            }
+        });
+
+        characterButton.addEventListener("click", async () => {
+            if (!playerToken) {
+                setStatus("Submit your preferences before checking your character.", "error");
+                return;
+            }
+            characterButton.disabled = true;
+            setStatus("Checking your character...");
+            try {
+                const data = await readResponse(await fetch("/character", {
+                    headers: {
+                        "X-Room-Code": connectedRoomCode,
+                        "X-Player-Token": playerToken,
+                    },
+                }));
+                const alignment = data.evil ? " (Evil)" : "";
+                setStatus(`Your character is ${data.character}${alignment}.`, "success");
+            } catch (error) {
+                setStatus(error.message, "error");
+            } finally {
+                characterButton.disabled = false;
             }
         });
     </script>

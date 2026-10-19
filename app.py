@@ -5,7 +5,8 @@ import random
 import re
 import subprocess
 import sys
-from lan_api import LanApiServer, get_lan_ipv4_address
+from dataclasses import dataclass
+from lan_api import CharacterRequest, LanApiServer, get_lan_ipv4_address
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
@@ -13,7 +14,7 @@ from tkinter import filedialog
 from urllib import request
 
 from whalebuffetgenerator import assign_roles, build_role_counts
-from whalebuffetgenerator.logic import ROLE_EFFECTS, ROLE_OPTIONS, ROLE_ORDER
+from whalebuffetgenerator.logic import ROLE_EFFECTS, ROLE_OPTIONS, ROLE_ORDER, UNSELECTABLE_ROLE_NAMES, normalize_player
 
 ROLE_COLORS = {
     "townsfolk": "#164e9c",
@@ -24,6 +25,20 @@ ROLE_COLORS = {
 SUMMONER_EFFECT = "No Demon"
 BOUNTY_HUNTER_EFFECT = "Turns a Townsfolk evil"
 LIL_MONSTA_EFFECT = "Becomes a Minion"
+MINIONLESS_DEMON_EFFECTS = {"kazali", "lord of typhon"}
+
+
+@dataclass(frozen=True)
+class NumericEffectChoice:
+    value: int
+    label: str
+
+
+@dataclass(frozen=True)
+class NumericSetupEffect:
+    role: str
+    choices: tuple[NumericEffectChoice, ...]
+    mode: str = "delta"
 
 
 def parse_imported_player(data):
@@ -44,6 +59,9 @@ def parse_imported_player(data):
     if any(not isinstance(data[field], str) for field in fields):
         raise ValueError("All five fields must contain text values.")
 
+    if any(data[role].strip().casefold() in UNSELECTABLE_ROLE_NAMES for role in ROLE_ORDER):
+        raise ValueError("Drunk, Lunatic, and Marionette cannot be selected as preferred roles.")
+
     name = data["name"].strip()
     if not name:
         raise ValueError("Player name cannot be empty.")
@@ -59,6 +77,27 @@ def normalize_room_code(room_code):
     if not re.fullmatch(r"[A-Z0-9]{6,12}", normalized):
         raise ValueError("Room codes must be 6 to 12 letters or numbers.")
     return normalized
+
+
+def resolve_player_character(player_token, player_tokens, grimoire_locked, assignments, character_names, evil_players=None):
+    player_name = player_tokens.get(player_token)
+    if player_name is None:
+        return 401, {"error": "This Client is not registered. Submit your preferences again to get access."}
+    if not grimoire_locked:
+        return 423, {"error": "The Storyteller has not locked the roles yet. Please wait until the Grimoire is locked."}
+    if not assignments:
+        return 409, {"error": "The Storyteller has locked the Grimoire, but roles have not been generated yet."}
+
+    assigned_role = next((role for name, role in assignments if name == player_name), None)
+    if assigned_role is None:
+        return 404, {"error": "Your assignment is not available in this Grimoire."}
+
+    return 200, {
+        "player": player_name,
+        "role": assigned_role,
+        "character": character_names.get(player_name, assigned_role.title()),
+        "evil": player_name in (evil_players or set()),
+    }
 
 
 def get_grimoire_storage_path():
@@ -96,7 +135,13 @@ def parse_remembered_grimoire(data):
         preferred_roles = saved_player["preferred_roles"]
         if not isinstance(preferred_roles, dict) or set(preferred_roles) != set(ROLE_ORDER):
             raise ValueError("Saved player preferences must include all four role types.")
-        player = parse_imported_player({"name": saved_player["name"], **preferred_roles})
+        compatible_preferences = {
+            role: ""
+            if isinstance(preferred_roles[role], str) and preferred_roles[role].casefold() in UNSELECTABLE_ROLE_NAMES
+            else preferred_roles[role]
+            for role in ROLE_ORDER
+        }
+        player = parse_imported_player({"name": saved_player["name"], **compatible_preferences})
         key = player["name"].casefold()
         if key in names:
             raise ValueError("Saved Grimoire contains duplicate player names.")
@@ -141,7 +186,7 @@ def build_available_dummy_name(existing_names, candidate_names=None):
 
 def assign_roles_for_counts(players, role_counts):
     player_list = [
-        {"name": player["name"], "preferred_roles": player.get("preferred_roles", {})}
+        normalize_player(player)
         for player in players
     ]
     assignments = []
@@ -169,15 +214,114 @@ def parse_distribution_effect(effect_text):
     if not isinstance(effect_text, str):
         return None
 
-    match = re.search(r"\+(\d+)\s+(outsider|outsiders|townsfolk|townsfolks|minion|minions|demon|demons)", effect_text.strip().lower())
-    if not match:
+    lowered = effect_text.strip().lower()
+    if re.search(r"\bx\s+outsiders?\b", lowered):
+        return NumericSetupEffect(role="outsider", choices=(), mode="total")
+
+    number = r"(?:[+-]\?|[+-]?\d+)"
+    village_idiot_match = re.search(rf"({number})\s+to\s+({number})\s+village\s+idiots?", lowered)
+    if village_idiot_match:
+        start_text, end_text = village_idiot_match.groups()
+        if "?" in start_text or "?" in end_text:
+            return NumericSetupEffect(role="village idiot", choices=(), mode="copy_range")
+        values = _integer_range(int(start_text), int(end_text))
+        return NumericSetupEffect(
+            role="village idiot",
+            choices=tuple(
+                NumericEffectChoice(
+                    value,
+                    format_numeric_effect_label("village idiot", value, start_text if value == int(start_text) else None),
+                )
+                for value in values
+            ),
+            mode="copies",
+        )
+
+    effect_matches = list(re.finditer(rf"({number}(?:\s+(?:to|or)\s+{number})?)\s+(outsiders?|townsfolks?|minions?|demons?)\b", lowered))
+    if not effect_matches:
         return None
 
-    amount = int(match.group(1))
-    raw_target = match.group(2).lower().rstrip("s")
-    if raw_target not in {"outsider", "townsfolk", "minion", "demon"}:
-        return None
-    return amount, raw_target
+    effect_match = effect_matches[-1]
+    numeric_text, role_name = effect_match.groups()
+    role = _normalize_effect_role(role_name)
+    if "?" in numeric_text:
+        return NumericSetupEffect(role=role, choices=(), mode="flex_range")
+
+    if " to " in numeric_text:
+        start_text, end_text = numeric_text.split(" to ")
+        values = _integer_range(int(start_text), int(end_text))
+        labels = [format_numeric_effect_label(role, value, start_text if value == int(start_text) else None) for value in values]
+    elif " or " in numeric_text:
+        signed_values = numeric_text.split(" or ")
+        values = [int(value) for value in signed_values]
+        labels = [format_numeric_effect_label(role, value, signed) for value, signed in zip(values, signed_values)]
+    else:
+        signed_value = numeric_text
+        values = [int(signed_value)]
+        labels = [format_numeric_effect_label(role, values[0], signed_value)]
+
+    return NumericSetupEffect(
+        role=role,
+        choices=tuple(NumericEffectChoice(value, label) for value, label in zip(values, labels)),
+    )
+
+
+def _integer_range(start, end):
+    step = 1 if end >= start else -1
+    return range(start, end + step, step)
+
+
+def _normalize_effect_role(role_name):
+    if role_name.startswith("townsfolk"):
+        return "townsfolk"
+    return role_name.rstrip("s")
+
+
+def format_numeric_effect_label(role, value, sign_text=None):
+    signed_number = sign_text if sign_text is not None else (f"+{value}" if value >= 0 else str(value))
+    if role == "village idiot":
+        role_label = "Village Idiot" if abs(value) == 1 else "Village Idiots"
+    else:
+        role_label = role.title() if abs(value) == 1 else f"{role.title()}s"
+    return f"{signed_number} {role_label}"
+
+
+def resolve_numeric_effect(effect, choice_value, assignments):
+    if effect.mode == "total":
+        current_total = sum(role == effect.role for _, role in assignments)
+        delta = choice_value - current_total
+    elif effect.mode == "copies":
+        return choice_value, "townsfolk", "townsfolk", True
+    else:
+        delta = choice_value
+
+    if delta == 0:
+        return 0, None, None, False
+
+    if effect.role == "townsfolk":
+        source_role, target_role = ("outsider", "townsfolk") if delta > 0 else ("townsfolk", "outsider")
+    elif delta > 0:
+        source_role, target_role = "townsfolk", effect.role
+    else:
+        source_role, target_role = effect.role, "townsfolk"
+    return abs(delta), source_role, target_role, False
+
+
+def numeric_effect_choices(effect, assignments):
+    if effect.mode == "total":
+        max_total = sum(role in {"townsfolk", "outsider"} for _, role in assignments)
+        return tuple(NumericEffectChoice(value, format_numeric_effect_label(effect.role, value)) for value in range(max_total + 1))
+    if effect.mode == "flex_range":
+        outsider_count = sum(role == "outsider" for _, role in assignments)
+        townsfolk_count = sum(role == "townsfolk" for _, role in assignments)
+        values = range(-outsider_count, townsfolk_count + 1)
+        return tuple(NumericEffectChoice(value, format_numeric_effect_label(effect.role, value)) for value in values)
+    return tuple(
+        choice
+        for choice in effect.choices
+        if resolve_numeric_effect(effect, choice.value, assignments)[0]
+        <= sum(role == resolve_numeric_effect(effect, choice.value, assignments)[1] for _, role in assignments)
+    )
 
 
 def format_pin_display(is_pinned):
@@ -279,18 +423,34 @@ def apply_lil_monsta_effect(assignments, player_name):
     return updated
 
 
-def collect_effect_candidates(assignments, effect_text, role_effects=None, applied_effect_players=None, character_names=None, excluded_player=None):
+def apply_minionless_demon_rule(assignments, demon_characters):
+    has_minionless_demon = any(
+        role == "demon"
+        and str(demon_characters.get(name, "")).casefold() in MINIONLESS_DEMON_EFFECTS
+        for name, role in assignments
+    )
+    if not has_minionless_demon:
+        return list(assignments), set()
+
+    converted_players = {name for name, role in assignments if role == "minion"}
+    updated = [(name, "townsfolk" if role == "minion" else role) for name, role in assignments]
+    updated.sort(key=lambda item: ROLE_ORDER.index(item[1]))
+    return updated, converted_players
+
+
+def collect_effect_candidates(assignments, effect_text, role_effects=None, applied_effect_players=None, character_names=None, excluded_player=None, effect_choice=None):
     parsed = parse_distribution_effect(effect_text)
     if parsed is None:
         return []
 
-    amount, target_role = parsed
-    if amount <= 0:
+    if effect_choice is None:
+        if len(parsed.choices) != 1:
+            return []
+        effect_choice = parsed.choices[0].value
+    amount, source_role, _, is_copy_effect = resolve_numeric_effect(parsed, effect_choice, assignments)
+    if amount <= 0 or source_role is None:
         return []
 
-    source_role = "townsfolk" if target_role == "outsider" else "outsider"
-    if source_role == target_role:
-        return []
 
     applied_effect_players = set(applied_effect_players or [])
     candidates = []
@@ -307,23 +467,21 @@ def collect_effect_candidates(assignments, effect_text, role_effects=None, appli
     return candidates
 
 
-def apply_distribution_effect(assignments, effect_text, selected_players=None):
+def apply_distribution_effect(assignments, effect_text, selected_players=None, effect_choice=None):
     parsed = parse_distribution_effect(effect_text)
     if parsed is None:
         return list(assignments)
 
-    amount, target_role = parsed
     if not assignments:
         return []
 
-    if target_role == "outsider":
-        source_role = "townsfolk"
-    elif target_role == "townsfolk":
-        source_role = "outsider"
-    else:
-        return list(assignments)
+    if effect_choice is None:
+        if len(parsed.choices) != 1:
+            return list(assignments)
+        effect_choice = parsed.choices[0].value
 
-    if source_role == target_role:
+    amount, source_role, target_role, is_copy_effect = resolve_numeric_effect(parsed, effect_choice, assignments)
+    if amount == 0 or source_role is None:
         return list(assignments)
 
     current = {name: role for name, role in assignments}
@@ -338,7 +496,7 @@ def apply_distribution_effect(assignments, effect_text, selected_players=None):
     else:
         chosen = eligible[:amount]
 
-    if not chosen:
+    if not chosen or is_copy_effect:
         return list(assignments)
 
     updated = []
@@ -419,6 +577,7 @@ class WhaleBuffetApp(tk.Tk):
         self.grimoire_locked = False
         self.lan_submissions = Queue()
         self.lan_session_server = None
+        self.player_tokens = {}
         self.style = ttk.Style(self)
 
         self._build_menu_bar()
@@ -455,7 +614,7 @@ class WhaleBuffetApp(tk.Tk):
                 "name": "Bob",
                 "preferred_roles": {
                     "townsfolk": "Washerwoman",
-                    "outsider": "Drunk",
+                    "outsider": "Butler",
                     "minion": "Poisoner",
                     "demon": "Imp",
                 },
@@ -473,7 +632,7 @@ class WhaleBuffetApp(tk.Tk):
                 "name": "Dora",
                 "preferred_roles": {
                     "townsfolk": "Balloonist",
-                    "outsider": "Drunk",
+                    "outsider": "Recluse",
                     "minion": "Baron",
                     "demon": "Fang Gu",
                 },
@@ -482,7 +641,7 @@ class WhaleBuffetApp(tk.Tk):
                 "name": "Evan",
                 "preferred_roles": {
                     "townsfolk": "Balloonist",
-                    "outsider": "Drunk",
+                    "outsider": "Butler",
                     "minion": "Baron",
                     "demon": "Fang Gu",
                 },
@@ -498,6 +657,8 @@ class WhaleBuffetApp(tk.Tk):
         self.effect_target_players = set()
         self.evil_players = set()
         self.lil_monsta_minion_players = {}
+        self.extra_character_players = {}
+        self.applied_effect_labels = {}
 
         self.player_table = ttk.Treeview(
             players_frame,
@@ -709,13 +870,43 @@ class WhaleBuffetApp(tk.Tk):
         if self.lan_session_server is None:
             return
         address = get_lan_ipv4_address()
-        messagebox.showinfo(
-            "LAN Session",
-            f"Players can connect to WBG at:\nhttp://{address}:{self.lan_session_server.port}\n\n"
-            f"Room code: {self.lan_session_server.room_code}\n\n"
-            "API endpoints: GET /session, GET /roles, POST /player",
-            parent=self,
+        web_address = f"http://{address}:{self.lan_session_server.port}"
+        dialog = tk.Toplevel(self)
+        dialog.title("LAN Session")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        content = ttk.Frame(dialog, padding=18)
+        content.pack(fill="both", expand=True)
+        ttk.Label(content, text="Players can connect to WBG at:").pack(anchor="w", pady=(0, 6))
+
+        link_color = "#83b6ff" if self.dark_mode else "#1d4fb9"
+        self.style.configure("SessionLink.TLabel", foreground=link_color, font=("Segoe UI", 10, "underline"))
+        self.session_address_label = ttk.Label(
+            content,
+            text=web_address,
+            style="SessionLink.TLabel",
+            cursor="hand2",
+            takefocus=True,
         )
+        self.session_address_label.pack(anchor="w")
+
+        def copy_address(event=None):
+            self.clipboard_clear()
+            self.clipboard_append(web_address)
+            self.update_idletasks()
+            self.session_address_status.configure(text="Address copied to clipboard.")
+
+        self.session_address_label.bind("<Button-1>", copy_address)
+        self.session_address_label.bind("<Return>", copy_address)
+        self.session_address_label.bind("<space>", copy_address)
+        self.session_address_label.focus_set()
+
+        ttk.Label(content, text=f"Room code: {self.lan_session_server.room_code}").pack(anchor="w", pady=(14, 0))
+        ttk.Label(content, text="API: GET /session, GET /roles, POST /player").pack(anchor="w", pady=(6, 0))
+        self.session_address_status = ttk.Label(content, text="Click the address to copy it.")
+        self.session_address_status.pack(anchor="w", pady=(10, 0))
+        ttk.Button(content, text="Close", command=dialog.destroy).pack(anchor="e", pady=(14, 0))
 
     def stop_lan_session(self):
         if self.lan_session_server is None:
@@ -738,6 +929,21 @@ class WhaleBuffetApp(tk.Tk):
             except Empty:
                 break
 
+            if isinstance(submission, CharacterRequest):
+                if self.lan_session_server is None:
+                    submission.resolve(503, {"error": "LAN session is no longer active."})
+                    continue
+                status_code, response_data = resolve_player_character(
+                    submission.player_token,
+                    self.player_tokens,
+                    self.grimoire_locked,
+                    self.assignment_rows,
+                    self.assignment_display_roles,
+                    self.evil_players,
+                )
+                submission.resolve(status_code, response_data)
+                continue
+
             if self.lan_session_server is None:
                 submission.resolve(503, "LAN session is no longer active.")
                 continue
@@ -752,6 +958,7 @@ class WhaleBuffetApp(tk.Tk):
                 continue
 
             self.players.append(player)
+            self.player_tokens[submission.player_token] = player["name"]
             self.refresh_player_table()
             self.status_var.set(f"Received preferences from {player['name']}.")
             self._save_remembered_grimoire()
@@ -1024,11 +1231,17 @@ class WhaleBuffetApp(tk.Tk):
             fallback = ROLE_OPTIONS.get(role, [role.title()])
             display_role = preferred_role or (fallback[0] if isinstance(fallback, list) and fallback else role.title())
             original_lil_monsta = self.lil_monsta_minion_players.get(name)
-            if role == "minion" and original_lil_monsta:
+            if name in self.extra_character_players:
+                display_role = "Village Idiot (Drunk)" if self.extra_character_players[name] else "Village Idiot"
+            elif role == "minion" and original_lil_monsta:
                 display_role = format_lil_monsta_character(original_lil_monsta, display_role)
             self.assignment_display_roles[name] = display_role
             effect = ROLE_EFFECTS.get(display_role, "") or ROLE_EFFECTS.get(role, "") or ""
-            if original_lil_monsta:
+            if name in self.applied_effect_labels:
+                effect = self.applied_effect_labels[name]
+            elif name in self.extra_character_players:
+                effect = ""
+            elif original_lil_monsta:
                 effect = LIL_MONSTA_EFFECT
             elif is_lil_monsta_character(display_role):
                 effect = LIL_MONSTA_EFFECT
@@ -1253,22 +1466,9 @@ class WhaleBuffetApp(tk.Tk):
         if parsed is None:
             return
 
-        amount, target_role = parsed
-        source_role = "townsfolk" if target_role == "outsider" else "outsider"
-        if source_role == target_role:
-            self.status_var.set("This effect cannot convert a player to the same role type.")
-            return
-
-        eligible = collect_effect_candidates(
-            self.assignment_rows,
-            effect_text,
-            role_effects=ROLE_EFFECTS,
-            applied_effect_players=self.applied_effect_players,
-            character_names=self.assignment_display_roles,
-            excluded_player=current_player_name,
-        )
-        if not eligible:
-            self.status_var.set(f"No valid {source_role} players are available to convert.")
+        choices = numeric_effect_choices(parsed, self.assignment_rows)
+        if not choices:
+            self.status_var.set("No legal numeric choices are available for this effect.")
             return
 
         dialog = tk.Toplevel(self)
@@ -1276,10 +1476,13 @@ class WhaleBuffetApp(tk.Tk):
         dialog.transient(self)
         dialog.grab_set()
         dialog.geometry(f"+{self.winfo_rootx() + 120}+{self.winfo_rooty() + 80}")
+        ttk.Label(dialog, text="Choose the setup effect:").pack(anchor="w", padx=12, pady=(12, 6))
+        choice_labels = [choice.label for choice in choices]
+        choices_by_label = {choice.label: choice for choice in choices}
+        choice_var = tk.StringVar(value=choice_labels[0])
+        choice_combo = ttk.Combobox(dialog, textvariable=choice_var, values=choice_labels, state="readonly", width=38)
+        choice_combo.pack(anchor="w", padx=12, pady=(0, 10))
 
-        tk.Label(dialog, text=f"Choose {amount} {source_role} player(s) to convert to {target_role}:").pack(anchor="w", padx=12, pady=(12, 8))
-
-        candidate_names = list(eligible)
         players_by_name = {player["name"]: player for player in self.players}
         candidate_frame = ttk.Frame(dialog)
         candidate_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -1288,11 +1491,11 @@ class WhaleBuffetApp(tk.Tk):
             columns=("player", "current", "new"),
             show="headings",
             selectmode="extended",
-            height=min(8, max(4, len(eligible))),
+            height=min(8, max(4, len(self.assignment_rows))),
         )
         candidate_table.heading("player", text="Player")
         candidate_table.heading("current", text="Current character")
-        candidate_table.heading("new", text=f"New {target_role.title()}")
+        candidate_table.heading("new", text="New character")
         candidate_table.column("player", width=140, anchor="w")
         candidate_table.column("current", width=180, anchor="w")
         candidate_table.column("new", width=180, anchor="w")
@@ -1303,36 +1506,91 @@ class WhaleBuffetApp(tk.Tk):
         candidate_frame.rowconfigure(0, weight=1)
         candidate_frame.columnconfigure(0, weight=1)
 
-        for index, name in enumerate(candidate_names):
-            candidate_table.insert(
-                "",
-                "end",
-                iid=str(index),
-                values=describe_effect_candidate(name, target_role, players_by_name, self.assignment_display_roles),
-            )
+        drunk_frame = ttk.Frame(dialog)
+        drunk_label = ttk.Label(drunk_frame, text="Which extra is drunk?")
+        drunk_label.pack(side="left", padx=(0, 8))
+        drunk_var = tk.StringVar()
+        drunk_combo = ttk.Combobox(drunk_frame, textvariable=drunk_var, state="readonly", width=24)
+        drunk_combo.pack(side="left")
+        candidate_names = []
 
-        for index in range(min(amount, len(eligible))):
-            candidate_table.selection_add(str(index))
+        def update_drunk_choices(event=None):
+            selected_names = [candidate_names[int(item_id)] for item_id in candidate_table.selection()]
+            previous_choice = drunk_var.get()
+            drunk_combo.configure(values=selected_names)
+            if previous_choice in selected_names:
+                drunk_var.set(previous_choice)
+            elif selected_names:
+                drunk_var.set(selected_names[0])
+            else:
+                drunk_var.set("")
+
+        def refresh_candidates(event=None):
+            nonlocal candidate_names
+            choice = choices_by_label[choice_var.get()]
+            amount, source_role, target_role, is_copy_effect = resolve_numeric_effect(parsed, choice.value, self.assignment_rows)
+            candidate_names = collect_effect_candidates(
+                self.assignment_rows,
+                effect_text,
+                role_effects=ROLE_EFFECTS,
+                applied_effect_players=self.applied_effect_players,
+                character_names=self.assignment_display_roles,
+                excluded_player=current_player_name,
+                effect_choice=choice.value,
+            ) if amount and source_role else []
+
+            for item in candidate_table.get_children():
+                candidate_table.delete(item)
+            candidate_table.heading("new", text="New Village Idiot" if is_copy_effect else f"New {target_role.title()}" if target_role else "New character")
+            for index, name in enumerate(candidate_names):
+                new_character = "Village Idiot" if is_copy_effect else None
+                values = (name, self.assignment_display_roles.get(name, "Unknown"), new_character or describe_effect_candidate(name, target_role or parsed.role, players_by_name, self.assignment_display_roles)[2])
+                candidate_table.insert("", "end", iid=str(index), values=values)
+            for index in range(min(amount, len(candidate_names))):
+                candidate_table.selection_add(str(index))
+
+            if is_copy_effect and amount:
+                drunk_frame.pack(anchor="w", padx=12, pady=(0, 10))
+                update_drunk_choices()
+            else:
+                drunk_frame.pack_forget()
+
+        candidate_table.bind("<<TreeviewSelect>>", update_drunk_choices)
+        choice_combo.bind("<<ComboboxSelected>>", refresh_candidates)
+        refresh_candidates()
 
         def apply_choice():
+            choice = choices_by_label[choice_var.get()]
+            amount, source_role, _, is_copy_effect = resolve_numeric_effect(parsed, choice.value, self.assignment_rows)
             selected = [candidate_names[int(item_id)] for item_id in candidate_table.selection()]
             if len(selected) != amount:
                 messagebox.showwarning(
                     "Select players",
-                    f"Please select exactly {amount} {source_role} player(s) to convert.",
+                    f"Please select exactly {amount} {source_role or 'affected'} player(s).",
                     parent=dialog,
                 )
+                return
+            if is_copy_effect and amount and drunk_var.get() not in selected:
+                messagebox.showwarning("Choose the drunk extra", "Select which new Village Idiot is drunk.", parent=dialog)
                 return
 
             self.assignment_pins.clear()
             if current_player_name is not None:
                 self.effect_source_players.add(current_player_name)
                 self.applied_effect_players.add(current_player_name)
+                self.applied_effect_labels[current_player_name] = choice.label
             self.effect_target_players.update(selected)
             self.applied_effect_players.update(selected)
-            self.assignment_rows = apply_distribution_effect(self.assignment_rows, effect_text, selected_players=selected)
+            if is_copy_effect:
+                self.extra_character_players.update({name: name == drunk_var.get() for name in selected})
+            self.assignment_rows = apply_distribution_effect(
+                self.assignment_rows,
+                effect_text,
+                selected_players=selected,
+                effect_choice=choice.value,
+            )
             self._refresh_assignment_output(self.assignment_rows)
-            self.status_var.set(f"Applied {effect_text} effect.")
+            self.status_var.set(f"Applied {choice.label} effect.")
             dialog.destroy()
 
         ttk.Button(dialog, text="Apply", command=apply_choice).pack(pady=(0, 12))
@@ -1350,6 +1608,8 @@ class WhaleBuffetApp(tk.Tk):
         self.effect_target_players.clear()
         self.evil_players.clear()
         self.lil_monsta_minion_players.clear()
+        self.extra_character_players.clear()
+        self.applied_effect_labels.clear()
         self._refresh_assignment_output(self.assignment_rows)
         self.status_var.set("All assignment effects have been reverted.")
 
@@ -1376,7 +1636,7 @@ class WhaleBuffetApp(tk.Tk):
         row_index = 1
         for role in ROLE_ORDER:
             ttk.Label(dialog, text=f"{role.title()}:").grid(row=row_index, column=0, padx=12, pady=(6, 6), sticky="w")
-            combo = ttk.Combobox(dialog, textvariable=preferred_vars[role], values=ROLE_OPTIONS.get(role, []), width=35)
+            combo = ttk.Combobox(dialog, textvariable=preferred_vars[role], values=ROLE_OPTIONS.get(role, []), state="readonly", width=35)
             combo.grid(row=row_index, column=1, padx=(0, 12), pady=(6, 6), sticky="ew")
             row_index += 1
 
@@ -1392,8 +1652,17 @@ class WhaleBuffetApp(tk.Tk):
                 self.players.append(player)
                 self.status_var.set(f"Added {name}.")
             else:
+                if current_player is None:
+                    self.status_var.set("No player selected to edit.")
+                    return
                 index = self.players.index(current_player)
                 self.players[index] = player
+                if current_player["name"].casefold() != name.casefold():
+                    self.player_tokens = {
+                        token: player_name
+                        for token, player_name in self.player_tokens.items()
+                        if player_name.casefold() != current_player["name"].casefold()
+                    }
                 self.status_var.set(f"Updated {name}.")
 
             self.refresh_player_table()
@@ -1463,6 +1732,10 @@ class WhaleBuffetApp(tk.Tk):
         index = children.index(selected[0])
         player_name = self.players[index]["name"]
         del self.players[index]
+        self.player_tokens = {
+            token: name for token, name in self.player_tokens.items()
+            if name.casefold() != player_name.casefold()
+        }
         self.clear_assignment_pins()
         self.refresh_player_table()
         self.status_var.set(f"Removed {player_name}.")
@@ -1477,6 +1750,7 @@ class WhaleBuffetApp(tk.Tk):
                 for row in self.output.get_children():
                     self.output.delete(row)
                 self.clear_assignment_pins()
+            self.player_tokens.clear()
             self._save_remembered_grimoire()
             return
 
@@ -1490,6 +1764,7 @@ class WhaleBuffetApp(tk.Tk):
             return
 
         self.players.clear()
+        self.player_tokens.clear()
         self.clear_assignment_pins()
         self.refresh_player_table()
         if hasattr(self, "output"):
@@ -1527,14 +1802,25 @@ class WhaleBuffetApp(tk.Tk):
         else:
             assignments = assign_roles(players)
 
-        self.base_assignment_rows = list(assignments)
-        self.assignment_rows = list(assignments)
-        self.assignment_pins = preserve_pins_for_assignments(current_pins, assignments)
         self.applied_effect_players.clear()
         self.effect_source_players.clear()
         self.effect_target_players.clear()
         self.evil_players.clear()
         self.lil_monsta_minion_players.clear()
+        self.extra_character_players.clear()
+        self.applied_effect_labels.clear()
+        self._refresh_assignment_output(assignments)
+
+        demon_characters = self.assignment_display_roles
+        assignments, converted_minions = apply_minionless_demon_rule(assignments, demon_characters)
+        if converted_minions:
+            counts["townsfolk"] += counts["minion"]
+            counts["minion"] = 0
+            current_pins = {name: role for name, role in current_pins.items() if name not in converted_minions}
+
+        self.base_assignment_rows = list(assignments)
+        self.assignment_rows = list(assignments)
+        self.assignment_pins = preserve_pins_for_assignments(current_pins, assignments)
         self._refresh_assignment_output(assignments)
 
         self.status_var.set(

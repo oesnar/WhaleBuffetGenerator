@@ -2,9 +2,11 @@ import json
 import random
 import re
 import urllib.request
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple, Union
 
 ROLE_ORDER = ["townsfolk", "outsider", "minion", "demon"]
+UNSELECTABLE_ROLE_NAMES = {"drunk", "lunatic", "marionette"}
 
 ROLE_COUNTS = {
     5: {"townsfolk": 3, "outsider": 0, "minion": 1, "demon": 1},
@@ -29,7 +31,7 @@ FALLBACK_ROLE_OPTIONS = {
         "Town Crier",
         "Nurse",
     ],
-    "outsider": ["Recluse", "Drunk", "Butler", "Saint"],
+    "outsider": ["Recluse", "Tinker", "Butler", "Saint"],
     "minion": ["Baron", "Poisoner", "Spy", "Mare", "Cult Leader"],
     "demon": ["Imp", "Fang Gu", "Vigormortis", "No Dashii", "Shabaloth"],
 }
@@ -40,7 +42,7 @@ def build_role_dictionary(raw_roles: Iterable[dict]) -> Dict[str, List[str]]:
     for item in raw_roles:
         team = item.get("team") if isinstance(item, dict) else None
         name = item.get("name") if isinstance(item, dict) else None
-        if team in grouped and name:
+        if team in grouped and name and name.casefold() not in UNSELECTABLE_ROLE_NAMES:
             grouped.setdefault(team, [])
             if name not in grouped[team]:
                 grouped[team].append(name)
@@ -64,7 +66,7 @@ def extract_distribution_effect(role_data: Union[str, dict, None]) -> str:
         modifier = match.strip()
         if not modifier:
             continue
-        if any(keyword in modifier.lower() for keyword in ["outsider", "outsiders", "townsfolk", "minion", "demon"]):
+        if any(keyword in modifier.lower() for keyword in ["outsider", "townsfolk", "minion", "demon", "village idiot"]):
             return modifier
     return ""
 
@@ -109,7 +111,12 @@ def normalize_player(player: Union[str, dict]) -> dict:
     if not isinstance(preferred_roles, dict):
         raise ValueError("Each player's preferred_roles must be a dictionary.")
 
-    normalized = {role: preferred_roles.get(role, "") for role in ROLE_ORDER}
+    normalized = {
+        role: "" if isinstance(preferred_roles.get(role, ""), str)
+        and preferred_roles.get(role, "").casefold() in UNSELECTABLE_ROLE_NAMES
+        else preferred_roles.get(role, "")
+        for role in ROLE_ORDER
+    }
     return {"name": str(name), "preferred_roles": normalized}
 
 

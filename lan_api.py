@@ -10,6 +10,7 @@ from werkzeug.serving import make_server
 class PlayerSubmission:
     def __init__(self, player):
         self.player = player
+        self.player_token = secrets.token_urlsafe(32)
         self.event = Event()
         self.status_code = None
         self.message = ""
@@ -17,6 +18,19 @@ class PlayerSubmission:
     def resolve(self, status_code, message):
         self.status_code = status_code
         self.message = message
+        self.event.set()
+
+
+class CharacterRequest:
+    def __init__(self, player_token):
+        self.player_token = player_token
+        self.event = Event()
+        self.status_code = None
+        self.response_data = None
+
+    def resolve(self, status_code, response_data):
+        self.status_code = status_code
+        self.response_data = response_data
         self.event.set()
 
 
@@ -65,7 +79,24 @@ class LanApiServer:
             self.submissions.put(submission)
             if not submission.event.wait(timeout=10):
                 return jsonify(error="WBG did not process the submission in time."), 503
-            return jsonify(message=submission.message), submission.status_code
+            response_data = {"message": submission.message}
+            if submission.status_code == 201:
+                response_data["player_token"] = submission.player_token
+            return jsonify(response_data), submission.status_code
+
+        @self.app.get("/character")
+        def get_character():
+            if not self._authorized():
+                return jsonify(error="Invalid room code."), 403
+            player_token = request.headers.get("X-Player-Token", "").strip()
+            if not player_token:
+                return jsonify(error="Submit your preferences from this Client before requesting your character."), 401
+
+            character_request = CharacterRequest(player_token)
+            self.submissions.put(character_request)
+            if not character_request.event.wait(timeout=10):
+                return jsonify(error="WBG did not process the character request in time."), 503
+            return jsonify(character_request.response_data), character_request.status_code
 
     def _authorized(self):
         supplied_code = request.headers.get("X-Room-Code", "").strip().upper()

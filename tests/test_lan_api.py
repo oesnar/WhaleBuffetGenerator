@@ -1,8 +1,8 @@
 from queue import Queue
 from threading import Thread
 
-from app import normalize_room_code, parse_imported_player
-from lan_api import LanApiServer
+from app import normalize_room_code, parse_imported_player, resolve_player_character
+from lan_api import CharacterRequest, LanApiServer
 
 
 ROOM_CODE = "ABCD23"
@@ -34,6 +34,67 @@ def test_session_and_roles_require_room_code():
     assert client.get("/session").status_code == 403
     assert client.get("/roles", headers={"X-Room-Code": ROOM_CODE}).json == {"roles": {"townsfolk": ["Librarian"]}}
     assert client.get("/session", headers={"X-Room-Code": ROOM_CODE}).json == {"active": True}
+
+
+def test_character_endpoint_requires_room_and_player_tokens():
+    server, _ = make_server()
+    client = server.app.test_client()
+
+    assert client.get("/character", headers={"X-Room-Code": ROOM_CODE}).status_code == 401
+    assert client.get("/character", headers={"X-Player-Token": "token"}).status_code == 403
+
+
+def test_character_endpoint_passes_token_request_to_wbg_queue():
+    server, submissions = make_server()
+    responses = []
+
+    def request_character():
+        with server.app.test_client() as client:
+            responses.append(
+                client.get(
+                    "/character",
+                    headers={"X-Room-Code": ROOM_CODE, "X-Player-Token": "player-token"},
+                )
+            )
+
+    request_thread = Thread(target=request_character, daemon=True)
+    request_thread.start()
+    character_request = submissions.get(timeout=2)
+    assert isinstance(character_request, CharacterRequest)
+    assert character_request.player_token == "player-token"
+    character_request.resolve(423, {"error": "Wait for the Storyteller to lock roles."})
+    request_thread.join(timeout=2)
+
+    assert not request_thread.is_alive()
+    assert responses[0].status_code == 423
+    assert "Wait for the Storyteller" in responses[0].json["error"]
+
+
+def test_character_lookup_waits_for_locked_grimoire():
+    status_code, response = resolve_player_character(
+        "player-token",
+        {"player-token": "Alice"},
+        False,
+        [("Alice", "townsfolk")],
+        {"Alice": "Librarian"},
+    )
+
+    assert status_code == 423
+    assert "wait" in response["error"].lower()
+
+
+def test_character_lookup_returns_only_the_token_owners_assignment():
+    status_code, response = resolve_player_character(
+        "player-token",
+        {"player-token": "Alice"},
+        True,
+        [("Alice", "townsfolk"), ("Bob", "demon")],
+        {"Alice": "Librarian", "Bob": "Imp"},
+        {"Alice"},
+    )
+
+    assert status_code == 200
+    assert response == {"player": "Alice", "role": "townsfolk", "character": "Librarian", "evil": True}
 
 
 def test_room_code_is_normalized_and_validated():
@@ -95,4 +156,5 @@ def test_post_player_returns_wbg_submission_result():
 
     assert not request_thread.is_alive()
     assert responses[0].status_code == 201
-    assert responses[0].json == {"message": "Player preferences received."}
+    assert responses[0].json["message"] == "Player preferences received."
+    assert responses[0].json["player_token"]
