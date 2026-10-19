@@ -44,6 +44,136 @@ jobs:
       - name: Build executable
         run: python build_exe.py
 
+      - name: Sign Windows executable
+        if: matrix.name == 'windows'
+        shell: pwsh
+        env:
+          CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
+          CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:CODESIGN_PFX_BASE64)) {
+            throw "Missing GitHub secret CODESIGN_PFX_BASE64."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:CODESIGN_PFX_PASSWORD)) {
+            throw "Missing GitHub secret CODESIGN_PFX_PASSWORD."
+          }
+
+          $exePath = "dist\WhaleBuffetGenerator.exe"
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          $cerPath = Join-Path $env:RUNNER_TEMP "codesign.cer"
+          $thumbprint = $null
+          $rootAdded = $false
+          $publisherAdded = $false
+          $myAdded = $false
+
+          if (-not (Test-Path $exePath)) {
+            throw "Executable not found: $exePath"
+          }
+
+          try {
+            # Decode the PFX secret into a temporary file.
+            $pfxBytes = [Convert]::FromBase64String(
+              $env:CODESIGN_PFX_BASE64
+            )
+            [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+
+            # Import the signing certificate into the runner's
+            # temporary Current User certificate store.
+            $securePassword = ConvertTo-SecureString `
+              -String $env:CODESIGN_PFX_PASSWORD `
+              -AsPlainText -Force
+
+            $signingCert = Import-PfxCertificate `
+              -FilePath $pfxPath `
+              -CertStoreLocation "Cert:\CurrentUser\My" `
+              -Password $securePassword
+
+            $thumbprint = $signingCert.Thumbprint
+            $myAdded = $true
+
+            # Trust the self-signed certificate on this ephemeral
+            # runner only, so SignTool can verify the signature.
+            Export-Certificate `
+              -Cert $signingCert `
+              -FilePath $cerPath | Out-Null
+
+            Import-Certificate `
+              -FilePath $cerPath `
+              -CertStoreLocation "Cert:\CurrentUser\Root" |
+              Out-Null
+            $rootAdded = $true
+
+            Import-Certificate `
+              -FilePath $cerPath `
+              -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" |
+              Out-Null
+            $publisherAdded = $true
+
+            # Locate the Windows SDK SignTool.
+            $signtool = Get-ChildItem `
+              "C:\Program Files (x86)\Windows Kits\10\bin" `
+              -Recurse -Filter signtool.exe |
+              Where-Object {
+                $_.FullName -match '\\x64\\signtool.exe$'
+              } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+
+            if (-not $signtool) {
+              throw "Windows SDK SignTool was not found."
+            }
+
+            # Sign and timestamp the executable.
+            & $signtool.FullName sign `
+              /f $pfxPath `
+              /p $env:CODESIGN_PFX_PASSWORD `
+              /fd SHA256 `
+              /tr https://timestamp.digicert.com `
+              /td SHA256 `
+              $exePath
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Executable signing failed."
+            }
+
+            # Verify the signed executable.
+            & $signtool.FullName verify /pa /v $exePath
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Signature verification failed."
+            }
+
+            Write-Host "Executable signed and verified successfully."
+          }
+          finally {
+            # Remove the temporary trust and private-key material.
+            if ($thumbprint) {
+              if ($publisherAdded) {
+                Remove-Item `
+                  "Cert:\CurrentUser\TrustedPublisher\$thumbprint" `
+                  -Force -ErrorAction SilentlyContinue
+              }
+
+              if ($rootAdded) {
+                Remove-Item `
+                  "Cert:\CurrentUser\Root\$thumbprint" `
+                  -Force -ErrorAction SilentlyContinue
+              }
+
+              if ($myAdded) {
+                Remove-Item `
+                  "Cert:\CurrentUser\My\$thumbprint" `
+                  -Force -ErrorAction SilentlyContinue
+              }
+            }
+
+            Remove-Item $pfxPath, $cerPath `
+              -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Copy final binary to release name
         shell: bash
         run: |
