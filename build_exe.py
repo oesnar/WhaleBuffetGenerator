@@ -6,15 +6,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 APP = ROOT / "app.py"
 ASSETS = ROOT / "assets"
+TEMPLATES = ROOT / "templates"
 ICON_ICO = ASSETS / "botc_icon.ico"
 ICON_ICNS = ASSETS / "botc_icon.icns"
 
 
 def add_data_args():
-    if not ASSETS.exists():
-        return []
     separator = ";" if os.name == "nt" else ":"
-    return ["--add-data", f"{ASSETS}{separator}assets"]
+    data_args = []
+    for source, destination in ((ASSETS, "assets"), (TEMPLATES, "templates")):
+        if source.exists():
+            data_args.extend(["--add-data", f"{source}{separator}{destination}"])
+    return data_args
 
 
 def build():

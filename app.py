@@ -1,11 +1,15 @@
 import os
+import json
+from queue import Empty, Queue
 import random
 import re
 import subprocess
 import sys
+from lan_api import LanApiServer, get_lan_ipv4_address
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog
 from urllib import request
 
 from whalebuffetgenerator import assign_roles, build_role_counts
@@ -20,6 +24,85 @@ ROLE_COLORS = {
 SUMMONER_EFFECT = "No Demon"
 BOUNTY_HUNTER_EFFECT = "Turns a Townsfolk evil"
 LIL_MONSTA_EFFECT = "Becomes a Minion"
+
+
+def parse_imported_player(data):
+    fields = {"name", *ROLE_ORDER}
+    if not isinstance(data, dict):
+        raise ValueError("The JSON file must contain one player object.")
+
+    missing = fields - data.keys()
+    unexpected = data.keys() - fields
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append("missing fields: " + ", ".join(sorted(missing)))
+        if unexpected:
+            details.append("unexpected fields: " + ", ".join(sorted(unexpected)))
+        raise ValueError("Expected exactly name, townsfolk, outsider, minion, and demon (" + "; ".join(details) + ").")
+
+    if any(not isinstance(data[field], str) for field in fields):
+        raise ValueError("All five fields must contain text values.")
+
+    name = data["name"].strip()
+    if not name:
+        raise ValueError("Player name cannot be empty.")
+
+    return {
+        "name": name,
+        "preferred_roles": {role: data[role].strip() for role in ROLE_ORDER},
+    }
+
+
+def normalize_room_code(room_code):
+    normalized = str(room_code).strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{6,12}", normalized):
+        raise ValueError("Room codes must be 6 to 12 letters or numbers.")
+    return normalized
+
+
+def get_grimoire_storage_path():
+    if os.name == "nt":
+        data_root = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        data_root = Path.home() / "Library" / "Application Support"
+    else:
+        data_root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return data_root / "WhaleBuffetGenerator" / "grimoire.json"
+
+
+def build_remembered_grimoire(players):
+    return {
+        "version": 1,
+        "players": [
+            {
+                "name": player["name"],
+                "preferred_roles": {role: player.get("preferred_roles", {}).get(role, "") for role in ROLE_ORDER},
+            }
+            for player in players
+        ],
+    }
+
+
+def parse_remembered_grimoire(data):
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("players"), list):
+        raise ValueError("Saved Grimoire data has an unsupported format.")
+
+    players = []
+    names = set()
+    for saved_player in data["players"]:
+        if not isinstance(saved_player, dict) or set(saved_player) != {"name", "preferred_roles"}:
+            raise ValueError("Saved player data has an invalid format.")
+        preferred_roles = saved_player["preferred_roles"]
+        if not isinstance(preferred_roles, dict) or set(preferred_roles) != set(ROLE_ORDER):
+            raise ValueError("Saved player preferences must include all four role types.")
+        player = parse_imported_player({"name": saved_player["name"], **preferred_roles})
+        key = player["name"].casefold()
+        if key in names:
+            raise ValueError("Saved Grimoire contains duplicate player names.")
+        names.add(key)
+        players.append(player)
+    return players
 
 
 def build_available_dummy_name(existing_names, candidate_names=None):
@@ -330,10 +413,16 @@ class WhaleBuffetApp(tk.Tk):
         self.configure_favicon()
         self.dark_mode = False
         self.dark_mode_var = tk.BooleanVar(value=False)
+        self.remember_grimoire_var = tk.BooleanVar(value=False)
+        self.remember_grimoire_path = get_grimoire_storage_path()
+        self.remember_grimoire_load_warning = ""
         self.grimoire_locked = False
+        self.lan_submissions = Queue()
+        self.lan_session_server = None
         self.style = ttk.Style(self)
 
         self._build_menu_bar()
+        self.protocol("WM_DELETE_WINDOW", self.close_app)
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -399,6 +488,7 @@ class WhaleBuffetApp(tk.Tk):
                 },
             },
         ]
+        self._load_remembered_grimoire()
         self.assignment_rows = []
         self.assignment_pins = {}
         self.base_assignment_rows = []
@@ -473,7 +563,7 @@ class WhaleBuffetApp(tk.Tk):
         self.revert_effects_button = ttk.Button(controls, text="Revert effects", command=self.revert_assignment_effects)
         self.revert_effects_button.grid(row=0, column=2, sticky="w", padx=(0, 12))
 
-        self.status_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar(value=self.remember_grimoire_load_warning)
         self.status_label = ttk.Label(controls, textvariable=self.status_var, foreground="#0b5d1d")
         self.status_label.grid(row=0, column=4, sticky="w")
 
@@ -528,6 +618,7 @@ class WhaleBuffetApp(tk.Tk):
         self.output.tag_configure("demon", foreground=ROLE_COLORS["demon"], font=("Segoe UI", 10, "bold"))
 
         self.apply_theme()
+        self.after(100, self._process_lan_submissions)
 
     def _build_menu_bar(self):
         menubar = tk.Menu(self)
@@ -542,17 +633,30 @@ class WhaleBuffetApp(tk.Tk):
             variable=self.dark_mode_var,
             command=self.toggle_theme,
         )
+        file_menu.add_checkbutton(
+            label="Remember Grimoire",
+            variable=self.remember_grimoire_var,
+            command=self.toggle_remember_grimoire,
+        )
         menubar.add_cascade(label="File", menu=file_menu)
         self.file_menu = file_menu
 
         manage_menu = tk.Menu(menubar, tearoff=0)
         manage_menu.add_command(label="Add dummy", command=self.add_dummy_player)
         manage_menu.add_command(label="Add player", command=self.add_player)
+        manage_menu.add_command(label="Import player", command=self.import_player)
         manage_menu.add_command(label="Edit player", command=self.edit_player)
         manage_menu.add_command(label="Remove player", command=self.remove_player)
         manage_menu.add_command(label="Clear players", command=self.clear_players)
         menubar.add_cascade(label="Manage", menu=manage_menu)
         self.manage_menu = manage_menu
+
+        session_menu = tk.Menu(menubar, tearoff=0)
+        session_menu.add_command(label="Start LAN session", command=self.start_lan_session)
+        session_menu.add_command(label="Show room details", command=self.show_lan_session_details, state="disabled")
+        session_menu.add_command(label="Stop LAN session", command=self.stop_lan_session, state="disabled")
+        menubar.add_cascade(label="LAN Session", menu=session_menu)
+        self.session_menu = session_menu
 
     def _detect_system_theme(self):
         return False
@@ -563,7 +667,98 @@ class WhaleBuffetApp(tk.Tk):
         except Exception:
             pass
         finally:
-            self.destroy()
+            self.close_app()
+
+    def start_lan_session(self):
+        if self.lan_session_server is not None:
+            self.show_lan_session_details()
+            return
+
+        room_code = simpledialog.askstring(
+            "Start LAN session",
+            "Choose a room code (6 to 12 letters or numbers):",
+            parent=self,
+        )
+        if room_code is None:
+            return
+        try:
+            room_code = normalize_room_code(room_code)
+        except ValueError as exc:
+            messagebox.showerror("Invalid room code", str(exc), parent=self)
+            return
+
+        self.lan_session_server = LanApiServer(
+            player_parser=parse_imported_player,
+            roles_provider=lambda: ROLE_OPTIONS,
+            submissions=self.lan_submissions,
+            room_code=room_code,
+        )
+        try:
+            self.lan_session_server.start()
+        except OSError as exc:
+            self.lan_session_server = None
+            messagebox.showerror("LAN Session", f"Could not start the LAN session: {exc}", parent=self)
+            return
+
+        self.session_menu.entryconfigure(0, state="disabled")
+        self.session_menu.entryconfigure(1, state="normal")
+        self.session_menu.entryconfigure(2, state="normal")
+        self.show_lan_session_details()
+
+    def show_lan_session_details(self):
+        if self.lan_session_server is None:
+            return
+        address = get_lan_ipv4_address()
+        messagebox.showinfo(
+            "LAN Session",
+            f"Players can connect to WBG at:\nhttp://{address}:{self.lan_session_server.port}\n\n"
+            f"Room code: {self.lan_session_server.room_code}\n\n"
+            "API endpoints: GET /session, GET /roles, POST /player",
+            parent=self,
+        )
+
+    def stop_lan_session(self):
+        if self.lan_session_server is None:
+            return
+        self.lan_session_server.stop()
+        self.lan_session_server = None
+        self.session_menu.entryconfigure(0, state="normal")
+        self.session_menu.entryconfigure(1, state="disabled")
+        self.session_menu.entryconfigure(2, state="disabled")
+        self.status_var.set("LAN session stopped.")
+
+    def close_app(self):
+        self.stop_lan_session()
+        self.destroy()
+
+    def _process_lan_submissions(self):
+        while True:
+            try:
+                submission = self.lan_submissions.get_nowait()
+            except Empty:
+                break
+
+            if self.lan_session_server is None:
+                submission.resolve(503, "LAN session is no longer active.")
+                continue
+            if self.grimoire_locked:
+                submission.resolve(423, "The Storyteller has locked the grimoire.")
+                continue
+
+            player = submission.player
+            existing_names = {existing["name"].casefold() for existing in self.players}
+            if player["name"].casefold() in existing_names:
+                submission.resolve(409, "A player with this name already exists.")
+                continue
+
+            self.players.append(player)
+            self.refresh_player_table()
+            self.status_var.set(f"Received preferences from {player['name']}.")
+            self._save_remembered_grimoire()
+            submission.resolve(201, "Player preferences received.")
+
+        if self.winfo_exists():
+            self.after(100, self._process_lan_submissions)
 
     def add_dummy_player(self):
         if self.grimoire_locked:
@@ -578,6 +773,7 @@ class WhaleBuffetApp(tk.Tk):
         self.players.append({"name": random_name, "preferred_roles": preferred_roles})
         self.refresh_player_table()
         self.status_var.set(f"Added dummy player {random_name}.")
+        self._save_remembered_grimoire()
 
     def configure_favicon(self):
         icon_dir = Path(__file__).resolve().parent / "assets"
@@ -688,6 +884,48 @@ class WhaleBuffetApp(tk.Tk):
         self.dark_mode = bool(self.dark_mode_var.get())
         self.apply_theme()
 
+    def _load_remembered_grimoire(self):
+        if not self.remember_grimoire_path.exists():
+            return
+        try:
+            saved_data = json.loads(self.remember_grimoire_path.read_text(encoding="utf-8"))
+            self.players = parse_remembered_grimoire(saved_data)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            self.remember_grimoire_load_warning = f"Could not load remembered Grimoire: {exc}"
+            return
+        self.remember_grimoire_var.set(True)
+
+    def _save_remembered_grimoire(self):
+        if not self.remember_grimoire_var.get():
+            return True
+        temporary_path = self.remember_grimoire_path.with_suffix(".tmp")
+        try:
+            self.remember_grimoire_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(build_remembered_grimoire(self.players), indent=2),
+                encoding="utf-8",
+            )
+            temporary_path.replace(self.remember_grimoire_path)
+        except OSError as exc:
+            self.status_var.set(f"Could not save remembered Grimoire: {exc}")
+            return False
+        return True
+
+    def toggle_remember_grimoire(self):
+        if self.remember_grimoire_var.get():
+            if self._save_remembered_grimoire():
+                self.status_var.set("Grimoire will be remembered on this computer.")
+            else:
+                self.remember_grimoire_var.set(False)
+            return
+
+        try:
+            self.remember_grimoire_path.unlink(missing_ok=True)
+            self.status_var.set("Remembered Grimoire disabled; defaults will load next time.")
+        except OSError as exc:
+            self.remember_grimoire_var.set(True)
+            self.status_var.set(f"Could not remove remembered Grimoire: {exc}")
+
     def toggle_grimoire_lock(self):
         self.grimoire_locked = not self.grimoire_locked
         widget_state = "disabled" if self.grimoire_locked else "normal"
@@ -701,8 +939,10 @@ class WhaleBuffetApp(tk.Tk):
         for button in managed_buttons:
             button.configure(state=widget_state)
 
-        for index in range(5):
-            self.manage_menu.entryconfigure(index, state=widget_state)
+        last_manage_entry = self.manage_menu.index("end")
+        if last_manage_entry is not None:
+            for index in range(last_manage_entry + 1):
+                self.manage_menu.entryconfigure(index, state=widget_state)
         self.file_menu.entryconfigure(0, state=widget_state)
         self.status_var.set("Grimoire locked." if self.grimoire_locked else "Grimoire unlocked.")
 
@@ -1157,6 +1397,7 @@ class WhaleBuffetApp(tk.Tk):
                 self.status_var.set(f"Updated {name}.")
 
             self.refresh_player_table()
+            self._save_remembered_grimoire()
             dialog.destroy()
 
         ttk.Button(dialog, text="Save", command=save_player).grid(row=row_index, column=0, columnspan=2, pady=(8, 12))
@@ -1166,6 +1407,35 @@ class WhaleBuffetApp(tk.Tk):
             return
         self.clear_assignment_pins()
         self._player_dialog("add")
+
+    def import_player(self):
+        if self.grimoire_locked:
+            return
+
+        file_path = filedialog.askopenfilename(
+            parent=self,
+            title="Import player preferences",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, encoding="utf-8") as player_file:
+                player = parse_imported_player(json.load(player_file))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            messagebox.showerror("Import player", str(exc), parent=self)
+            return
+
+        existing_names = {existing["name"].casefold() for existing in self.players}
+        if player["name"].casefold() in existing_names:
+            messagebox.showerror("Import player", f"A player named {player['name']} already exists.", parent=self)
+            return
+
+        self.players.append(player)
+        self.refresh_player_table()
+        self.status_var.set(f"Imported player {player['name']}.")
+        self._save_remembered_grimoire()
 
     def edit_player(self):
         if self.grimoire_locked:
@@ -1196,6 +1466,7 @@ class WhaleBuffetApp(tk.Tk):
         self.clear_assignment_pins()
         self.refresh_player_table()
         self.status_var.set(f"Removed {player_name}.")
+        self._save_remembered_grimoire()
 
     def clear_players(self):
         if self.grimoire_locked:
@@ -1206,6 +1477,7 @@ class WhaleBuffetApp(tk.Tk):
                 for row in self.output.get_children():
                     self.output.delete(row)
                 self.clear_assignment_pins()
+            self._save_remembered_grimoire()
             return
 
         confirm = tk.messagebox.askyesno(
@@ -1224,6 +1496,7 @@ class WhaleBuffetApp(tk.Tk):
             for row in self.output.get_children():
                 self.output.delete(row)
         self.status_var.set("The Grimoire has been wiped.")
+        self._save_remembered_grimoire()
 
     def generate_roles(self):
         if self.grimoire_locked:

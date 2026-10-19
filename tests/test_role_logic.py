@@ -7,6 +7,7 @@ from app import (
     apply_summoner_effect,
     build_available_dummy_name,
     build_assignment_row_tags,
+    build_remembered_grimoire,
     collect_bounty_hunter_candidates,
     collect_effect_candidates,
     collect_summoner_candidates,
@@ -17,6 +18,8 @@ from app import (
     format_pin_display,
     is_lil_monsta_character,
     parse_distribution_effect,
+    parse_imported_player,
+    parse_remembered_grimoire,
     preserve_pins_for_assignments,
 )
 from whalebuffetgenerator import build_role_counts, assign_roles
@@ -213,6 +216,63 @@ def test_format_assignment_export_includes_table_columns():
     assert format_assignment_export([(1, "Alice", "Librarian", "", "")]) == (
         "#\tPlayer\tCharacter\tEffect\tPin\n1\tAlice\tLibrarian\t\t"
     )
+
+
+def test_parse_imported_player_requires_exact_five_fields_and_skips_role_validation():
+    imported = parse_imported_player(
+        {
+            "name": "  Alice  ",
+            "townsfolk": "Unknown Townsfolk",
+            "outsider": "Custom Outsider",
+            "minion": "Custom Minion",
+            "demon": "Custom Demon",
+        }
+    )
+
+    assert imported == {
+        "name": "Alice",
+        "preferred_roles": {
+            "townsfolk": "Unknown Townsfolk",
+            "outsider": "Custom Outsider",
+            "minion": "Custom Minion",
+            "demon": "Custom Demon",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"name": "Alice", "townsfolk": "A", "outsider": "B", "minion": "C"},
+        {"name": "Alice", "townsfolk": "A", "outsider": "B", "minion": "C", "demon": "D", "extra": "E"},
+    ],
+)
+def test_parse_imported_player_rejects_missing_or_extra_fields(data):
+    with pytest.raises(ValueError):
+        parse_imported_player(data)
+
+
+def test_remembered_grimoire_round_trip_preserves_players_and_empty_roster():
+    players = [
+        {
+            "name": "Alice",
+            "preferred_roles": {"townsfolk": "Librarian", "outsider": "Recluse", "minion": "Baron", "demon": "Imp"},
+        }
+    ]
+
+    assert parse_remembered_grimoire(build_remembered_grimoire(players)) == players
+    assert parse_remembered_grimoire(build_remembered_grimoire([])) == []
+
+
+def test_remembered_grimoire_rejects_duplicate_names():
+    player = {
+        "name": "Alice",
+        "preferred_roles": {"townsfolk": "Librarian", "outsider": "Recluse", "minion": "Baron", "demon": "Imp"},
+    }
+    saved = build_remembered_grimoire([player, {**player, "name": "alice"}])
+
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_remembered_grimoire(saved)
 
 
 def test_describe_effect_candidate_shows_current_and_new_character():
