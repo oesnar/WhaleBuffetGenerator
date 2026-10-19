@@ -1,0 +1,81 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+            artifact_name: WhaleBuffetGenerator-Windows-x64.exe
+            built_binary: dist/WhaleBuffetGenerator.exe
+          - os: ubuntu-latest
+            name: linux
+            artifact_name: WhaleBuffetGenerator-Linux-x64
+            built_binary: dist/WhaleBuffetGenerator
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build executable
+        run: python build_exe.py
+
+      - name: Copy final binary to release name
+        shell: bash
+        run: |
+          ls -R dist
+          cp "${{ matrix.built_binary }}" "${{ matrix.artifact_name }}"
+          ls -l "${{ matrix.artifact_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: List build outputs
+        shell: bash
+        run: |
+          find release-assets -maxdepth 2 -type f | sort
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/**

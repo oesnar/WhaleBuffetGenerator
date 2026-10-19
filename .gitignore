@@ -1,0 +1,22 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# PyInstaller build outputs
+/build/
+/dist/
+/WhaleBuffetGenerator.spec
+
+# Local/editor files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*~
