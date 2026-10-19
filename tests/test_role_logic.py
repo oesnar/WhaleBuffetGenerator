@@ -2,11 +2,20 @@ import pytest
 
 from app import (
     apply_distribution_effect,
+    apply_lil_monsta_effect,
     apply_pinned_assignments,
+    apply_summoner_effect,
     build_available_dummy_name,
+    build_assignment_row_tags,
+    collect_bounty_hunter_candidates,
     collect_effect_candidates,
+    collect_summoner_candidates,
+    describe_effect_candidate,
+    format_assignment_export,
     format_effect_display,
+    format_lil_monsta_character,
     format_pin_display,
+    is_lil_monsta_character,
     parse_distribution_effect,
     preserve_pins_for_assignments,
 )
@@ -198,6 +207,95 @@ def test_format_effect_display_and_pin_display_are_separate():
     assert format_effect_display("+1 Outsider", True) == "+1 Outsider ✓"
     assert format_pin_display(True) == "📌"
     assert format_pin_display(False) == ""
+
+
+def test_format_assignment_export_includes_table_columns():
+    assert format_assignment_export([(1, "Alice", "Librarian", "", "")]) == (
+        "#\tPlayer\tCharacter\tEffect\tPin\n1\tAlice\tLibrarian\t\t"
+    )
+
+
+def test_describe_effect_candidate_shows_current_and_new_character():
+    players = {
+        "Alice": {
+            "name": "Alice",
+            "preferred_roles": {"outsider": "Recluse"},
+        }
+    }
+
+    assert describe_effect_candidate("Alice", "outsider", players, {"Alice": "Librarian"}) == (
+        "Alice",
+        "Librarian",
+        "Recluse",
+    )
+
+
+def test_summoner_candidates_only_include_available_demon():
+    assignments = [
+        ("Alice", "townsfolk"),
+        ("Bob", "demon"),
+        ("Charlie", "minion"),
+    ]
+
+    assert collect_summoner_candidates(assignments, excluded_player="Alice") == ["Bob"]
+    assert collect_summoner_candidates(assignments, unavailable_players={"Bob"}) == []
+
+
+def test_bounty_hunter_candidates_are_other_available_townsfolk_only():
+    assignments = [
+        ("Alice", "townsfolk"),
+        ("Bob", "townsfolk"),
+        ("Charlie", "outsider"),
+        ("Dana", "minion"),
+        ("Evan", "demon"),
+    ]
+
+    assert collect_bounty_hunter_candidates(assignments, excluded_player="Alice") == ["Bob"]
+    assert collect_bounty_hunter_candidates(assignments, unavailable_players={"Alice", "Bob"}) == []
+
+
+def test_bounty_hunter_target_tags_keep_purple_background_and_minion_red_priority():
+    tags = build_assignment_row_tags("townsfolk", effect_targeted=True, is_evil=True)
+
+    assert tags == ("evil_targeted",)
+
+
+def test_apply_summoner_effect_replaces_selected_demon_with_townsfolk():
+    assignments = [
+        ("Alice", "townsfolk"),
+        ("Bob", "demon"),
+        ("Charlie", "minion"),
+    ]
+
+    result = apply_summoner_effect(assignments, "Bob")
+
+    assert result == [
+        ("Alice", "townsfolk"),
+        ("Bob", "townsfolk"),
+        ("Charlie", "minion"),
+    ]
+    assert apply_summoner_effect(assignments, "Alice") == assignments
+
+
+def test_lil_monsta_effect_changes_only_its_own_demon_team_to_minion():
+    assignments = [
+        ("Alice", "townsfolk"),
+        ("Bob", "demon"),
+        ("Charlie", "minion"),
+    ]
+
+    assert apply_lil_monsta_effect(assignments, "Bob") == [
+        ("Alice", "townsfolk"),
+        ("Bob", "minion"),
+        ("Charlie", "minion"),
+    ]
+    assert apply_lil_monsta_effect(assignments, "Alice") == assignments
+
+
+def test_lil_monsta_display_retains_original_and_minion_character():
+    assert is_lil_monsta_character("Lil' Monsta")
+    assert is_lil_monsta_character("Lil’ Monsta")
+    assert format_lil_monsta_character("Lil' Monsta", "Baron") == "Lil' Monsta (Baron)"
 
 
 def test_preserve_pins_for_assignments_keeps_valid_pins_across_rerolls():

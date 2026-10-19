@@ -17,6 +17,9 @@ ROLE_COLORS = {
     "minion": "#b14b4b",
     "demon": "#9d1515",
 }
+SUMMONER_EFFECT = "No Demon"
+BOUNTY_HUNTER_EFFECT = "Turns a Townsfolk evil"
+LIL_MONSTA_EFFECT = "Becomes a Minion"
 
 
 def build_available_dummy_name(existing_names, candidate_names=None):
@@ -98,6 +101,13 @@ def format_pin_display(is_pinned):
     return "📌" if is_pinned else ""
 
 
+def format_assignment_export(rows):
+    headers = ("#", "Player", "Character", "Effect", "Pin")
+    lines = ["\t".join(headers)]
+    lines.extend("\t".join(str(value) for value in row) for row in rows)
+    return "\n".join(lines)
+
+
 def format_effect_display(effect_text, is_consumed=False):
     if not effect_text:
         return ""
@@ -105,6 +115,85 @@ def format_effect_display(effect_text, is_consumed=False):
     if not stripped:
         return ""
     return f"{stripped} ✓" if is_consumed else stripped
+
+
+def build_assignment_row_tags(role, is_pinned=False, effect_applied=False, effect_targeted=False, effect_clickable=False, is_evil=False):
+    if is_evil and effect_targeted:
+        return ("evil_targeted",)
+
+    tags = [role]
+    if is_pinned:
+        tags.append("pinned")
+    if effect_applied:
+        tags.append("effect_applied")
+    elif effect_targeted:
+        tags.append("effect_targeted")
+    if effect_clickable and not effect_applied:
+        tags.append("effect_clickable")
+    return tuple(tags)
+
+
+def describe_effect_candidate(player_name, target_role, players_by_name, character_names):
+    player = players_by_name.get(player_name, {})
+    preferred_roles = player.get("preferred_roles", {})
+    role_options = ROLE_OPTIONS.get(target_role, [])
+    new_character = preferred_roles.get(target_role) or (role_options[0] if role_options else target_role.title())
+    current_character = character_names.get(player_name, "Unknown")
+    return player_name, current_character, new_character
+
+
+def collect_summoner_candidates(assignments, unavailable_players=None, excluded_player=None):
+    unavailable_players = set(unavailable_players or [])
+    return [
+        name
+        for name, role in assignments
+        if role == "demon"
+        and name not in unavailable_players
+        and name != excluded_player
+    ]
+
+
+def collect_bounty_hunter_candidates(assignments, unavailable_players=None, excluded_player=None):
+    unavailable_players = set(unavailable_players or [])
+    return [
+        name
+        for name, role in assignments
+        if role == "townsfolk"
+        and name not in unavailable_players
+        and name != excluded_player
+    ]
+
+
+def apply_summoner_effect(assignments, selected_player):
+    if not any(name == selected_player and role == "demon" for name, role in assignments):
+        return list(assignments)
+
+    updated = [
+        (name, "townsfolk" if name == selected_player and role == "demon" else role)
+        for name, role in assignments
+    ]
+    updated.sort(key=lambda item: ROLE_ORDER.index(item[1]))
+    return updated
+
+
+def is_lil_monsta_character(character_name):
+    return re.sub(r"[^a-z]", "", str(character_name).casefold()) == "lilmonsta"
+
+
+def format_lil_monsta_character(lil_monsta_character, minion_character):
+    return f"{lil_monsta_character} ({minion_character})"
+
+
+def apply_lil_monsta_effect(assignments, player_name):
+    if not any(name == player_name and role == "demon" for name, role in assignments):
+        return list(assignments)
+
+    updated = [
+        (name, "minion" if name == player_name and role == "demon" else role)
+        for name, role in assignments
+    ]
+    updated.sort(key=lambda item: ROLE_ORDER.index(item[1]))
+    return updated
 
 
 def collect_effect_candidates(assignments, effect_text, role_effects=None, applied_effect_players=None, character_names=None, excluded_player=None):
@@ -241,6 +330,7 @@ class WhaleBuffetApp(tk.Tk):
         self.configure_favicon()
         self.dark_mode = False
         self.dark_mode_var = tk.BooleanVar(value=False)
+        self.grimoire_locked = False
         self.style = ttk.Style(self)
 
         self._build_menu_bar()
@@ -253,6 +343,8 @@ class WhaleBuffetApp(tk.Tk):
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(0, weight=1)
         main_frame.rowconfigure(1, weight=0)
+        main_frame.rowconfigure(2, weight=1)
+        main_frame.rowconfigure(3, weight=0)
 
         players_frame = ttk.LabelFrame(main_frame, text="Players", padding=(12, 10))
         players_frame.grid(row=0, column=0, sticky="nsew")
@@ -284,7 +376,7 @@ class WhaleBuffetApp(tk.Tk):
                 "preferred_roles": {
                     "townsfolk": "Fortune Teller",
                     "outsider": "Recluse",
-                    "minion": "Baron",
+                    "minion": "Summoner",
                     "demon": "Pukka",
                 },
             },
@@ -314,6 +406,8 @@ class WhaleBuffetApp(tk.Tk):
         self.applied_effect_players = set()
         self.effect_source_players = set()
         self.effect_target_players = set()
+        self.evil_players = set()
+        self.lil_monsta_minion_players = {}
 
         self.player_table = ttk.Treeview(
             players_frame,
@@ -351,10 +445,16 @@ class WhaleBuffetApp(tk.Tk):
         buttons.columnconfigure(2, weight=1)
         buttons.columnconfigure(3, weight=1)
 
-        ttk.Button(buttons, text="Add player", command=self.add_player).grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        ttk.Button(buttons, text="Edit player", command=self.edit_player).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(buttons, text="Remove player", command=self.remove_player).grid(row=0, column=2, sticky="ew", padx=(6, 0))
-        ttk.Button(buttons, text="Clear players", command=self.clear_players).grid(row=0, column=3, sticky="ew", padx=(6, 0))
+        self.player_action_buttons = [
+            ttk.Button(buttons, text="Add player", command=self.add_player),
+            ttk.Button(buttons, text="Edit player", command=self.edit_player),
+            ttk.Button(buttons, text="Remove player", command=self.remove_player),
+            ttk.Button(buttons, text="Clear players", command=self.clear_players),
+        ]
+        for index, button in enumerate(self.player_action_buttons):
+            left_pad = 0 if index == 0 else 6
+            right_pad = 0 if index == 3 else 6
+            button.grid(row=0, column=index, sticky="ew", padx=(left_pad, right_pad))
 
         controls = ttk.Frame(main_frame)
         controls.grid(row=1, column=0, sticky="ew", pady=(10, 8))
@@ -410,9 +510,18 @@ class WhaleBuffetApp(tk.Tk):
         self.output.tag_configure("effect_clickable", foreground="#1d4fb9", font=("Segoe UI", 10, "bold"))
         self.output.tag_configure("effect_applied", foreground="#1d2430", font=("Segoe UI", 10, "bold", "overstrike"))
         self.output.tag_configure("effect_targeted", background="#e9defd", foreground="#3f2d5a", font=("Segoe UI", 10, "bold"))
+        self.output.tag_configure("evil_targeted", background="#e9defd", foreground=ROLE_COLORS["minion"], font=("Segoe UI", 10, "bold"))
         self.output_scroll.configure(style="Minimal.Vertical.TScrollbar")
         self.output.bind("<Double-Button-1>", self.toggle_selected_assignment_pin)
         self.output.bind("<ButtonRelease-1>", self._handle_effect_click)
+
+        footer = ttk.Frame(main_frame)
+        footer.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        footer.columnconfigure(0, weight=1)
+        self.lock_button = ttk.Button(footer, text="Lock grimoire", command=self.toggle_grimoire_lock, style="Botc.TButton")
+        self.lock_button.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.export_button = ttk.Button(footer, text="Export assignments", command=self.export_assignments, style="Botc.TButton")
+        self.export_button.grid(row=0, column=2, sticky="e")
 
         self.output.tag_configure("outsider", foreground=ROLE_COLORS["outsider"], font=("Segoe UI", 10, "bold"))
         self.output.tag_configure("minion", foreground=ROLE_COLORS["minion"], font=("Segoe UI", 10, "bold"))
@@ -434,6 +543,7 @@ class WhaleBuffetApp(tk.Tk):
             command=self.toggle_theme,
         )
         menubar.add_cascade(label="File", menu=file_menu)
+        self.file_menu = file_menu
 
         manage_menu = tk.Menu(menubar, tearoff=0)
         manage_menu.add_command(label="Add dummy", command=self.add_dummy_player)
@@ -442,6 +552,7 @@ class WhaleBuffetApp(tk.Tk):
         manage_menu.add_command(label="Remove player", command=self.remove_player)
         manage_menu.add_command(label="Clear players", command=self.clear_players)
         menubar.add_cascade(label="Manage", menu=manage_menu)
+        self.manage_menu = manage_menu
 
     def _detect_system_theme(self):
         return False
@@ -455,6 +566,8 @@ class WhaleBuffetApp(tk.Tk):
             self.destroy()
 
     def add_dummy_player(self):
+        if self.grimoire_locked:
+            return
         used_names = {player["name"] for player in self.players}
         random_name = build_available_dummy_name(used_names)
         preferred_roles = {}
@@ -554,6 +667,7 @@ class WhaleBuffetApp(tk.Tk):
             self.output.tag_configure("effect_clickable", foreground="#1d4fb9", font=("Segoe UI", 10, "bold"))
             self.output.tag_configure("effect_applied", foreground="#1d2430", font=("Segoe UI", 10, "bold", "overstrike"))
             self.output.tag_configure("effect_targeted", background="#e9defd", foreground="#3f2d5a", font=("Segoe UI", 10, "bold"))
+            self.output.tag_configure("evil_targeted", background="#e9defd", foreground=ROLE_COLORS["minion"], font=("Segoe UI", 10, "bold"))
 
         for widget in self.winfo_children():
             try:
@@ -573,6 +687,38 @@ class WhaleBuffetApp(tk.Tk):
     def toggle_theme(self):
         self.dark_mode = bool(self.dark_mode_var.get())
         self.apply_theme()
+
+    def toggle_grimoire_lock(self):
+        self.grimoire_locked = not self.grimoire_locked
+        widget_state = "disabled" if self.grimoire_locked else "normal"
+        self.lock_button.configure(text="Unlock grimoire" if self.grimoire_locked else "Lock grimoire")
+
+        managed_buttons = self.player_action_buttons + [
+            self.generate_button,
+            self.pin_button,
+            self.revert_effects_button,
+        ]
+        for button in managed_buttons:
+            button.configure(state=widget_state)
+
+        for index in range(5):
+            self.manage_menu.entryconfigure(index, state=widget_state)
+        self.file_menu.entryconfigure(0, state=widget_state)
+        self.status_var.set("Grimoire locked." if self.grimoire_locked else "Grimoire unlocked.")
+
+    def export_assignments(self):
+        rows = [self.output.item(item, "values") for item in self.output.get_children()]
+        rows = [row for row in rows if len(row) >= 5 and row[1]]
+        if not rows:
+            self.status_var.set("Generate assignments before exporting.")
+            return
+
+        self.clipboard_clear()
+        self.clipboard_append(format_assignment_export(rows))
+        self.update_idletasks()
+        self.export_button.configure(text="Copied!")
+        self.status_var.set("Assignments copied to clipboard.")
+        self.after(1800, lambda: self.export_button.configure(text="Export assignments"))
 
     def clear_assignment_pins(self):
         self.assignment_pins.clear()
@@ -595,6 +741,8 @@ class WhaleBuffetApp(tk.Tk):
             self.player_table.insert("", "end", values=values)
 
     def toggle_selected_assignment_pin(self, event=None):
+        if self.grimoire_locked:
+            return
         selected = self.output.selection()
         if not selected:
             self.status_var.set("Select an assignment to pin or unpin.")
@@ -635,27 +783,39 @@ class WhaleBuffetApp(tk.Tk):
             preferred_role = player.get("preferred_roles", {}).get(role, "")
             fallback = ROLE_OPTIONS.get(role, [role.title()])
             display_role = preferred_role or (fallback[0] if isinstance(fallback, list) and fallback else role.title())
+            original_lil_monsta = self.lil_monsta_minion_players.get(name)
+            if role == "minion" and original_lil_monsta:
+                display_role = format_lil_monsta_character(original_lil_monsta, display_role)
             self.assignment_display_roles[name] = display_role
             effect = ROLE_EFFECTS.get(display_role, "") or ROLE_EFFECTS.get(role, "") or ""
-            is_clickable = parse_distribution_effect(effect) is not None
+            if original_lil_monsta:
+                effect = LIL_MONSTA_EFFECT
+            elif is_lil_monsta_character(display_role):
+                effect = LIL_MONSTA_EFFECT
+            elif display_role.casefold() == "summoner":
+                effect = SUMMONER_EFFECT
+            elif display_role.casefold() == "bounty hunter":
+                effect = BOUNTY_HUNTER_EFFECT
+            is_clickable = parse_distribution_effect(effect) is not None or effect in {SUMMONER_EFFECT, BOUNTY_HUNTER_EFFECT, LIL_MONSTA_EFFECT}
             is_pinned = name in self.assignment_pins and self.assignment_pins[name] == role
             effect_display = format_effect_display(effect, name in self.effect_source_players)
             pin_label = format_pin_display(is_pinned)
-            row_tags = (role,)
-            if is_pinned:
-                row_tags = (role, "pinned")
-            if name in self.effect_source_players:
-                row_tags = row_tags + ("effect_applied",)
-            elif name in self.effect_target_players:
-                row_tags = row_tags + ("effect_targeted",)
-            if is_clickable and name not in self.effect_source_players:
-                row_tags = row_tags + ("effect_clickable",)
+            row_tags = build_assignment_row_tags(
+                role,
+                is_pinned=is_pinned,
+                effect_applied=name in self.effect_source_players,
+                effect_targeted=name in self.effect_target_players,
+                effect_clickable=is_clickable,
+                is_evil=name in self.evil_players,
+            )
 
             self.output.insert("", "end", values=(index, name, display_role, effect_display, pin_label), tags=row_tags)
 
         self.output.tag_configure("pinned", foreground="#8a93a6")
 
     def _handle_effect_click(self, event):
+        if self.grimoire_locked:
+            return
         region = self.output.identify_region(event.x, event.y)
         if region != "cell":
             return
@@ -677,10 +837,176 @@ class WhaleBuffetApp(tk.Tk):
             return
 
         effect_text = values[3]
+        if effect_text == SUMMONER_EFFECT:
+            self._open_summoner_effect_dialog(player_name)
+            return
+        if effect_text == BOUNTY_HUNTER_EFFECT:
+            self._open_bounty_hunter_dialog(player_name)
+            return
+        if effect_text == LIL_MONSTA_EFFECT:
+            self._apply_lil_monsta_effect(player_name)
+            return
+
         if not effect_text or parse_distribution_effect(effect_text) is None:
             return
 
         self._open_distribution_effect_dialog(effect_text, player_name)
+
+    def _apply_lil_monsta_effect(self, player_name):
+        current_role = next((role for name, role in self.assignment_rows if name == player_name), None)
+        lil_monsta_character = self.assignment_display_roles.get(player_name, "")
+        if current_role != "demon" or not is_lil_monsta_character(lil_monsta_character):
+            self.status_var.set("Lil' Monsta can only change its own Demon assignment.")
+            return
+
+        self.assignment_pins.clear()
+        self.lil_monsta_minion_players[player_name] = lil_monsta_character
+        self.effect_source_players.add(player_name)
+        self.applied_effect_players.add(player_name)
+        self.assignment_rows = apply_lil_monsta_effect(self.assignment_rows, player_name)
+        self._refresh_assignment_output(self.assignment_rows)
+        self.status_var.set(f"{player_name} is Lil' Monsta and is now also a Minion.")
+
+    def _open_summoner_effect_dialog(self, current_player_name=None):
+        eligible = collect_summoner_candidates(
+            self.assignment_rows,
+            unavailable_players=self.effect_target_players | self.applied_effect_players,
+            excluded_player=current_player_name,
+        )
+        if not eligible:
+            self.status_var.set("No valid Demon players are available to convert.")
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Apply Summoner effect")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry(f"+{self.winfo_rootx() + 120}+{self.winfo_rooty() + 80}")
+        tk.Label(dialog, text="Choose the Demon player to replace with their preferred Townsfolk character:").pack(
+            anchor="w", padx=12, pady=(12, 8)
+        )
+
+        candidate_names = list(eligible)
+        players_by_name = {player["name"]: player for player in self.players}
+        candidate_frame = ttk.Frame(dialog)
+        candidate_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        candidate_table = ttk.Treeview(
+            candidate_frame,
+            columns=("player", "current", "new"),
+            show="headings",
+            selectmode="browse",
+            height=min(8, max(4, len(eligible))),
+        )
+        candidate_table.heading("player", text="Player")
+        candidate_table.heading("current", text="Current Demon")
+        candidate_table.heading("new", text="New Townsfolk")
+        candidate_table.column("player", width=140, anchor="w")
+        candidate_table.column("current", width=180, anchor="w")
+        candidate_table.column("new", width=180, anchor="w")
+        candidate_scroll = ttk.Scrollbar(candidate_frame, orient="vertical", command=candidate_table.yview)
+        candidate_table.configure(yscrollcommand=candidate_scroll.set)
+        candidate_table.grid(row=0, column=0, sticky="nsew")
+        candidate_scroll.grid(row=0, column=1, sticky="ns")
+        candidate_frame.rowconfigure(0, weight=1)
+        candidate_frame.columnconfigure(0, weight=1)
+
+        for index, name in enumerate(candidate_names):
+            candidate_table.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=describe_effect_candidate(name, "townsfolk", players_by_name, self.assignment_display_roles),
+            )
+        candidate_table.selection_set("0")
+
+        def apply_choice():
+            selected = candidate_table.selection()
+            if len(selected) != 1:
+                messagebox.showwarning("Select a player", "Please select one Demon player.", parent=dialog)
+                return
+
+            selected_player = candidate_names[int(selected[0])]
+            self.assignment_pins.clear()
+            if current_player_name is not None:
+                self.effect_source_players.add(current_player_name)
+                self.applied_effect_players.add(current_player_name)
+            self.effect_target_players.add(selected_player)
+            self.applied_effect_players.add(selected_player)
+            self.assignment_rows = apply_summoner_effect(self.assignment_rows, selected_player)
+            self._refresh_assignment_output(self.assignment_rows)
+            self.status_var.set("Applied Summoner effect.")
+            dialog.destroy()
+
+        ttk.Button(dialog, text="Apply", command=apply_choice).pack(pady=(0, 12))
+
+    def _open_bounty_hunter_dialog(self, current_player_name=None):
+        eligible = collect_bounty_hunter_candidates(
+            self.assignment_rows,
+            unavailable_players=self.effect_target_players | self.applied_effect_players | self.evil_players,
+            excluded_player=current_player_name,
+        )
+        if not eligible:
+            self.status_var.set("No valid Townsfolk players are available to turn evil.")
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Apply Bounty Hunter effect")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry(f"+{self.winfo_rootx() + 120}+{self.winfo_rooty() + 80}")
+        tk.Label(dialog, text="Choose a Townsfolk to turn evil. Their character and team remain unchanged:").pack(
+            anchor="w", padx=12, pady=(12, 8)
+        )
+
+        candidate_names = list(eligible)
+        candidate_frame = ttk.Frame(dialog)
+        candidate_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        candidate_table = ttk.Treeview(
+            candidate_frame,
+            columns=("player", "character"),
+            show="headings",
+            selectmode="browse",
+            height=min(8, max(4, len(eligible))),
+        )
+        candidate_table.heading("player", text="Player")
+        candidate_table.heading("character", text="Current Townsfolk")
+        candidate_table.column("player", width=160, anchor="w")
+        candidate_table.column("character", width=220, anchor="w")
+        candidate_scroll = ttk.Scrollbar(candidate_frame, orient="vertical", command=candidate_table.yview)
+        candidate_table.configure(yscrollcommand=candidate_scroll.set)
+        candidate_table.grid(row=0, column=0, sticky="nsew")
+        candidate_scroll.grid(row=0, column=1, sticky="ns")
+        candidate_frame.rowconfigure(0, weight=1)
+        candidate_frame.columnconfigure(0, weight=1)
+
+        for index, name in enumerate(candidate_names):
+            candidate_table.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(name, self.assignment_display_roles.get(name, "Unknown")),
+            )
+        candidate_table.selection_set("0")
+
+        def apply_choice():
+            selected = candidate_table.selection()
+            if len(selected) != 1:
+                messagebox.showwarning("Select a player", "Please select one Townsfolk player.", parent=dialog)
+                return
+
+            selected_player = candidate_names[int(selected[0])]
+            self.assignment_pins.clear()
+            if current_player_name is not None:
+                self.effect_source_players.add(current_player_name)
+                self.applied_effect_players.add(current_player_name)
+            self.evil_players.add(selected_player)
+            self.effect_target_players.add(selected_player)
+            self.applied_effect_players.add(selected_player)
+            self._refresh_assignment_output(self.assignment_rows)
+            self.status_var.set(f"{selected_player} remains Townsfolk and is now evil.")
+            dialog.destroy()
+
+        ttk.Button(dialog, text="Apply", command=apply_choice).pack(pady=(0, 12))
 
     def _open_distribution_effect_dialog(self, effect_text, current_player_name=None):
         parsed = parse_distribution_effect(effect_text)
@@ -713,16 +1039,43 @@ class WhaleBuffetApp(tk.Tk):
 
         tk.Label(dialog, text=f"Choose {amount} {source_role} player(s) to convert to {target_role}:").pack(anchor="w", padx=12, pady=(12, 8))
 
-        listbox = tk.Listbox(dialog, selectmode="multiple", height=min(8, max(4, len(eligible))))
-        for name in eligible:
-            listbox.insert(tk.END, name)
-        listbox.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        candidate_names = list(eligible)
+        players_by_name = {player["name"]: player for player in self.players}
+        candidate_frame = ttk.Frame(dialog)
+        candidate_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        candidate_table = ttk.Treeview(
+            candidate_frame,
+            columns=("player", "current", "new"),
+            show="headings",
+            selectmode="extended",
+            height=min(8, max(4, len(eligible))),
+        )
+        candidate_table.heading("player", text="Player")
+        candidate_table.heading("current", text="Current character")
+        candidate_table.heading("new", text=f"New {target_role.title()}")
+        candidate_table.column("player", width=140, anchor="w")
+        candidate_table.column("current", width=180, anchor="w")
+        candidate_table.column("new", width=180, anchor="w")
+        candidate_scroll = ttk.Scrollbar(candidate_frame, orient="vertical", command=candidate_table.yview)
+        candidate_table.configure(yscrollcommand=candidate_scroll.set)
+        candidate_table.grid(row=0, column=0, sticky="nsew")
+        candidate_scroll.grid(row=0, column=1, sticky="ns")
+        candidate_frame.rowconfigure(0, weight=1)
+        candidate_frame.columnconfigure(0, weight=1)
+
+        for index, name in enumerate(candidate_names):
+            candidate_table.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=describe_effect_candidate(name, target_role, players_by_name, self.assignment_display_roles),
+            )
 
         for index in range(min(amount, len(eligible))):
-            listbox.select_set(index)
+            candidate_table.selection_add(str(index))
 
         def apply_choice():
-            selected = [listbox.get(index) for index in listbox.curselection()]
+            selected = [candidate_names[int(item_id)] for item_id in candidate_table.selection()]
             if len(selected) != amount:
                 messagebox.showwarning(
                     "Select players",
@@ -734,7 +1087,9 @@ class WhaleBuffetApp(tk.Tk):
             self.assignment_pins.clear()
             if current_player_name is not None:
                 self.effect_source_players.add(current_player_name)
+                self.applied_effect_players.add(current_player_name)
             self.effect_target_players.update(selected)
+            self.applied_effect_players.update(selected)
             self.assignment_rows = apply_distribution_effect(self.assignment_rows, effect_text, selected_players=selected)
             self._refresh_assignment_output(self.assignment_rows)
             self.status_var.set(f"Applied {effect_text} effect.")
@@ -743,6 +1098,8 @@ class WhaleBuffetApp(tk.Tk):
         ttk.Button(dialog, text="Apply", command=apply_choice).pack(pady=(0, 12))
 
     def revert_assignment_effects(self):
+        if self.grimoire_locked:
+            return
         if self.base_assignment_rows:
             self.assignment_rows = list(self.base_assignment_rows)
         else:
@@ -751,6 +1108,8 @@ class WhaleBuffetApp(tk.Tk):
         self.applied_effect_players.clear()
         self.effect_source_players.clear()
         self.effect_target_players.clear()
+        self.evil_players.clear()
+        self.lil_monsta_minion_players.clear()
         self._refresh_assignment_output(self.assignment_rows)
         self.status_var.set("All assignment effects have been reverted.")
 
@@ -803,10 +1162,14 @@ class WhaleBuffetApp(tk.Tk):
         ttk.Button(dialog, text="Save", command=save_player).grid(row=row_index, column=0, columnspan=2, pady=(8, 12))
 
     def add_player(self):
+        if self.grimoire_locked:
+            return
         self.clear_assignment_pins()
         self._player_dialog("add")
 
     def edit_player(self):
+        if self.grimoire_locked:
+            return
         selected = self.player_table.selection()
         if not selected:
             self.status_var.set("Select a player to edit first.")
@@ -819,6 +1182,8 @@ class WhaleBuffetApp(tk.Tk):
         self._player_dialog("edit", current_player)
 
     def remove_player(self):
+        if self.grimoire_locked:
+            return
         selected = self.player_table.selection()
         if not selected:
             self.status_var.set("Select a player to remove first.")
@@ -833,6 +1198,8 @@ class WhaleBuffetApp(tk.Tk):
         self.status_var.set(f"Removed {player_name}.")
 
     def clear_players(self):
+        if self.grimoire_locked:
+            return
         if not self.players:
             self.status_var.set("There are no players to clear.")
             if hasattr(self, "output"):
@@ -859,6 +1226,8 @@ class WhaleBuffetApp(tk.Tk):
         self.status_var.set("The Grimoire has been wiped.")
 
     def generate_roles(self):
+        if self.grimoire_locked:
+            return
         players = self.players
         if not players:
             self.status_var.set("Add at least one player.")
@@ -891,6 +1260,8 @@ class WhaleBuffetApp(tk.Tk):
         self.applied_effect_players.clear()
         self.effect_source_players.clear()
         self.effect_target_players.clear()
+        self.evil_players.clear()
+        self.lil_monsta_minion_players.clear()
         self._refresh_assignment_output(assignments)
 
         self.status_var.set(
